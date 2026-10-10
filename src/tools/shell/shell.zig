@@ -125,6 +125,17 @@ fn decode_input(
         else => return null,
     };
     if (raw != .object) return null;
+    if (raw.object.get("request")) |wrapper| {
+        if (raw.object.count() != 1) return null;
+        raw = if (wrapper == .string)
+            std.json.parseFromSliceLeaky(std.json.Value, arena, wrapper.string, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            }
+        else
+            wrapper;
+        if (raw != .object) return null;
+    }
     const raw_action = raw.object.get("action") orelse return null;
     if (raw_action != .string) return null;
     const action = std.meta.stringToEnum(Action, raw_action.string) orelse
@@ -1901,6 +1912,45 @@ test "shell action fields are closed and command authority covers every run" {
     );
 }
 
+test "shell decode accepts JSON object strings without weakening validation" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}",
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\"}\"}",
+    }) |args| {
+        const decoded = try decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .input => |input| {
+                defer input.deinit(alloc);
+                const value = input.as(OwnedInput).value;
+                try std.testing.expectEqual(Action.run, value.action);
+                try std.testing.expectEqualStrings("pwd", value.command.?);
+            },
+            .failure => |failure| {
+                alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    for ([_][]const u8{
+        "{\"request\":\"not json\"}",
+        "{\"request\":\"[]\"}",
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":3}\"}",
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\",\\\"timeout_ms\\\":0}\"}",
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\",\\\"command\\\":\\\"true\\\"}\"}",
+        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\"}\",\"command\":\"true\"}",
+    }) |args| {
+        const decoded = try decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| alloc.free(failure),
+        }
+    }
+}
+
 test "shell timeout minimum is enforced before correction and execution" {
     const alloc = std.testing.allocator;
     const zero = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"true\",\"timeout_ms\":0}");
@@ -1940,7 +1990,6 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"sleep 30\",\"timeout_ms\":\"40000\",\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000,\"timeout_ms\":40000}" },
         .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
-        .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
         .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
         .{ .input = "{}", .retry = null },

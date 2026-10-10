@@ -9,6 +9,7 @@ const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -870,8 +871,14 @@ pub const Reducer = struct {
             }
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
-            if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
-            try self.accept_identity(&tool.id, non_null(delta, "id"), self.limits.identity_bytes);
+            if (non_null(delta, "type")) |kind| {
+                const text = try string(kind);
+                if (text.len != 0 and !std.mem.eql(u8, text, "function")) return error.InvalidChunk;
+            }
+            if (non_null(delta, "id")) |value_id| {
+                const id = try string(value_id);
+                if (id.len != 0) try self.accept_identity(&tool.id, value_id, self.limits.identity_bytes);
+            }
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
             };
@@ -1056,7 +1063,14 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
             else => return err,
         };
         const chunk = data orelse return error.IncompleteStream;
-        const deltas = try reducer.accept(chunk, cancel_flag.load(.seq_cst));
+        const deltas = reducer.accept(chunk, cancel_flag.load(.seq_cst)) catch |err| {
+            if (io_mod.getenv("FX_TRACE_CHAT_CHUNKS")) |enabled| {
+                if (std.mem.eql(u8, enabled, "1")) {
+                    debug_trace.logf("gateway", "chat_chunk_rejected err={s} event={d} bytes={d} chunk={s}", .{ @errorName(err), reducer.event_count, chunk.len, chunk });
+                }
+            }
+            return err;
+        };
         if (events) |sink| {
             for (deltas.reasoning) |delta| if (delta) |text| {
                 if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -1114,6 +1128,29 @@ fn test_finish(reducer: *Reducer, terminal: []const u8) Error!stream_provider.Re
     try test_accept(reducer, terminal);
     try test_accept(reducer, "[DONE]");
     return reducer.finish(false);
+}
+
+test "chat completions empty tool metadata preserves fragmented calls" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]}}]}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function\":{\"arguments\":\"\\\"path\\\":\\\"x\\\"}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("call-1", calls[0].id);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", calls[0].arguments_json);
+}
+
+test "chat completions empty tool ids still require a final identity" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}");
+    try std.testing.expectError(error.InvalidToolCallId, test_finish(&reducer, test_tools_finish));
 }
 
 test "chat completions reasoning fields survive a completed response" {
@@ -2472,7 +2509,9 @@ test "chat completions missing tool fields sparse indexes and invalid identities
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read_file\"}}", .failure = error.InvalidToolArguments, .at_finish = true },
         .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
-        .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidChunk },
+        .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidToolCallId, .at_finish = true },
+        .{ .delta = "{\"index\":0,\"type\":\"invalid\"}", .failure = error.InvalidChunk },
+        .{ .delta = "{\"index\":0,\"type\":7}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":\"not_advertised\"}}", .failure = error.InvalidToolName },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },

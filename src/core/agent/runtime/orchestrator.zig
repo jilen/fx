@@ -1339,6 +1339,12 @@ fn normalized_terminal_request_arguments(
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
+    if (request.* == .string) {
+        request.* = std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), request.string, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+    }
     if (request.* != .object) return null;
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
@@ -2265,6 +2271,21 @@ test "terminal request projection cleans every partial allocation failure" {
         check_terminal_request_projection_allocation_failures,
         .{},
     );
+}
+
+test "terminal request normalization accepts object JSON strings" {
+    const alloc = std.testing.allocator;
+    const normalized = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\"}\"}")).?;
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"pwd\"}", normalized);
+    for ([_][]const u8{
+        "{\"request\":\"invalid\"}",
+        "{\"request\":\"[]\"}",
+        "{\"request\":\"{\\\"command\\\":\\\"pwd\\\",\\\"command\\\":\\\"true\\\"}\"}",
+        "{\"request\":\"{}\",\"command\":\"pwd\"}",
+    }) |args| {
+        try std.testing.expectEqual(@as(?[]u8, null), try normalized_terminal_request_arguments(alloc, args));
+    }
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {

@@ -908,6 +908,7 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
+        if (reports_only_zeros(incoming, incoming_total)) return;
         const usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
@@ -933,7 +934,11 @@ pub const Reducer = struct {
             [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total },
         ) |previous, current, was_final| {
             if (previous) |prior| {
-                if (current.? < prior or (was_final and current.? != prior)) return error.ConflictingIdentity;
+                // A count fx already holds as zero is not an observation a later
+                // snapshot has to reproduce, so a gateway may fill it in later.
+                // Every nonzero prior keeps its exact assertion, so a gateway that
+                // reports a real count still cannot revise or walk it back.
+                if (current.? < prior or (was_final and prior != 0 and current.? != prior)) return error.ConflictingIdentity;
             }
         }
         self.usage = usage;
@@ -1036,6 +1041,23 @@ fn index_value(value: std.json.Value) Error!usize {
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
     const value = non_null(fields, key) orelse return null;
     return std.math.cast(u64, try integer(value)) orelse error.InvalidChunk;
+}
+
+/// A gateway that reports usage on every delta can insert a snapshot whose
+/// counts are all zero immediately before its terminal totals, and a completed
+/// response always bills at least its prompt. A snapshot that reports counts
+/// and reports nothing but zeros therefore reports nothing at all: fx keeps the
+/// counts it already observed instead of walking them back to zero. A snapshot
+/// that reports no count is not a zero snapshot, it simply says nothing and
+/// merges like any other partial snapshot.
+fn reports_only_zeros(incoming: types.Usage, total: ?u64) bool {
+    var reported = false;
+    for ([_]?u64{ incoming.input_tokens, incoming.output_tokens, total }) |count| {
+        const value = count orelse continue;
+        reported = true;
+        if (value != 0) return false;
+    }
+    return reported;
 }
 
 fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []const u8, limit: usize, failure: Error) Error!void {
@@ -1777,6 +1799,94 @@ test "chat completions partial usage rejects conflicts against merged observatio
         try std.testing.expectEqual(previous_total, reducer.usage_total);
         try std.testing.expectEqualDeep(previous_final_fields, reducer.usage_final_fields);
         try std.testing.expectEqual(.closed, reducer.phase);
+    }
+}
+
+test "chat completions gateway zero usage placeholders yield to the final counts" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    // Gateways that attach usage to every delta report zeros while the model is
+    // still producing, then carry the real counts in the usage-only snapshot
+    // that follows finish_reason.
+    const zeros = "{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}";
+    try test_usage_snapshot(&reducer, zeros);
+    try test_usage_snapshot(&reducer, zeros);
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, zeros);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":5120,\"completion_tokens\":120,\"total_tokens\":5240}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 5120), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 120), result.completed.completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 5240), reducer.usage_total);
+}
+
+test "chat completions gateway zero usage snapshots never become the billed total" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    // magpie reports cumulative usage on every delta and inserts an all-zero
+    // snapshot immediately before finish_reason.
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":17,\"completion_tokens\":59,\"total_tokens\":76}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}");
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":17,\"completion_tokens\":61,\"total_tokens\":78}");
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":17,\"completion_tokens\":61,\"total_tokens\":78}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 17), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 61), result.completed.completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 78), reducer.usage_total);
+}
+
+test "chat completions a lone zero count is a zero snapshot and merges nothing" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_stop);
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}");
+    // A snapshot carrying only zeros reports nothing, so the observed counts stand.
+    for ([_][]const u8{
+        "{\"completion_tokens\":0}",
+        "{\"prompt_tokens\":0,\"completion_tokens\":0}",
+        "{\"total_tokens\":0}",
+    }) |zero| try test_usage_snapshot(&reducer, zero);
+    try std.testing.expectEqual(@as(?u64, 10), reducer.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 4), reducer.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 14), reducer.usage_total);
+    // A snapshot that reports no count at all still merges as a partial snapshot.
+    try test_usage_snapshot(&reducer, "{\"prompt_tokens\":null,\"completion_tokens\":null,\"total_tokens\":null}");
+    try std.testing.expectEqual(@as(?u64, 10), reducer.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 4), reducer.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 14), reducer.usage_total);
+    // Once those counts are final, a real revision is still refused.
+    try std.testing.expectError(error.ConflictingIdentity, test_usage_snapshot(&reducer, "{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}"));
+}
+
+test "chat completions zero usage placeholders do not relax real conflicts" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { first: []const u8, next: []const u8 }{
+        // A gateway still cannot revise a nonzero count it already reported.
+        .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}" },
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":9}" },
+        .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":12}" },
+        // A snapshot that keeps any real count is judged on all of its counts,
+        // so one dropped back to zero beside it is still a conflict.
+        .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}" },
+    }) |case| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_stop);
+        try test_usage_snapshot(&reducer, case.first);
+        const previous = reducer.usage;
+        const previous_total = reducer.usage_total;
+        try std.testing.expectError(error.ConflictingIdentity, test_usage_snapshot(&reducer, case.next));
+        try std.testing.expectEqualDeep(previous, reducer.usage);
+        try std.testing.expectEqual(previous_total, reducer.usage_total);
     }
 }
 

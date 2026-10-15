@@ -1776,9 +1776,245 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
-pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
-    if (builtin.os.tag != .macos) return error.Unsupported;
+/// Image media types fx can attach from a clipboard selection.
+const supported_clipboard_image_types = [_][]const u8{
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+};
 
+/// Linux selection tools, in the order fx tries them. A Wayland session that
+/// owns the clipboard is preferred over an X11 selection it may also expose.
+const linux_clipboard_backends = [_]ClipboardBackend{ .wayland, .x11 };
+
+const ClipboardBackend = enum {
+    wayland,
+    x11,
+
+    /// Command that prints the offered selection targets, one per line.
+    fn listArgv(self: ClipboardBackend) []const []const u8 {
+        return switch (self) {
+            .wayland => &.{ "wl-paste", "--list-types" },
+            .x11 => &.{ "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o" },
+        };
+    }
+
+    /// Command that prints the raw bytes of one offered target.
+    fn readArgv(
+        self: ClipboardBackend,
+        media_type: []const u8,
+        buffer: *[6][]const u8,
+    ) []const []const u8 {
+        return switch (self) {
+            .wayland => {
+                buffer[0] = "wl-paste";
+                buffer[1] = "--no-newline";
+                buffer[2] = "--type";
+                buffer[3] = media_type;
+                return buffer[0..4];
+            },
+            .x11 => {
+                buffer[0] = "xclip";
+                buffer[1] = "-selection";
+                buffer[2] = "clipboard";
+                buffer[3] = "-t";
+                buffer[4] = media_type;
+                buffer[5] = "-o";
+                return buffer[0..6];
+            },
+        };
+    }
+
+    fn installHint(self: ClipboardBackend) []const u8 {
+        return switch (self) {
+            .wayland => "install wl-clipboard (wl-paste)",
+            .x11 => "install xclip",
+        };
+    }
+};
+
+pub const clipboard_tool_missing_notice = "no clipboard image tool found; " ++
+    linux_clipboard_backends[0].installHint() ++ " or " ++
+    linux_clipboard_backends[1].installHint();
+
+pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    switch (builtin.os.tag) {
+        .macos => return loadMacosClipboardImageAttachment(alloc),
+        .linux => return loadLinuxClipboardImageAttachment(alloc),
+        else => return error.Unsupported,
+    }
+}
+
+/// Picks the first offered target fx can attach. The source's own ordering
+/// wins, so a clipboard that offers PNG before JPEG keeps PNG. The returned
+/// slice borrows from `offered`.
+fn preferredClipboardImageType(offered: []const u8) ?[]const u8 {
+    var targets = std.mem.tokenizeAny(u8, offered, "\r\n, \t");
+    while (targets.next()) |target| {
+        for (supported_clipboard_image_types) |supported| {
+            if (std.ascii.eqlIgnoreCase(target, supported)) return supported;
+        }
+    }
+    return null;
+}
+
+fn loadLinuxClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
+    var tool_available = false;
+    for (linux_clipboard_backends) |backend| {
+        const offered = runClipboardCapture(
+            alloc,
+            backend.listArgv(),
+            .limited(64 * 1024),
+        ) catch |err| switch (err) {
+            error.ClipboardToolNotFound => continue,
+            error.ClipboardProcessFailed => continue,
+            else => return err,
+        };
+        defer alloc.free(offered);
+        tool_available = true;
+
+        const media_type = preferredClipboardImageType(offered) orelse {
+            debug_trace.logf("images", "event=clipboard_image_skipped reason=no_supported_target backend={s}", .{@tagName(backend)});
+            continue;
+        };
+
+        var argv_buffer: [6][]const u8 = undefined;
+        const bytes = runClipboardCapture(
+            alloc,
+            backend.readArgv(media_type, &argv_buffer),
+            .limited(max_image_bytes),
+        ) catch |err| switch (err) {
+            error.ClipboardToolNotFound => return error.ClipboardToolMissing,
+            error.ClipboardProcessFailed => return error.NoClipboardImage,
+            error.StreamTooLong => return error.ImageTooLarge,
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        if (bytes.len == 0) return error.NoClipboardImage;
+
+        const source_dir = try createTempSnapshotDir(alloc);
+        errdefer {
+            cleanupSnapshotDir(source_dir);
+            alloc.free(source_dir);
+        }
+        const temp_path = try std.fs.path.join(alloc, &.{ source_dir, clipboardSnapshotName(media_type) });
+        defer alloc.free(temp_path);
+        try writeClipboardSnapshot(temp_path, bytes);
+        const attachment = try loadImageAttachment(alloc, temp_path);
+        return .{ .attachment = attachment, .source_dir = source_dir };
+    }
+
+    if (tool_available) return error.NoClipboardImage;
+    return error.ClipboardToolMissing;
+}
+
+fn clipboardSnapshotName(media_type: []const u8) []const u8 {
+    for (supported_clipboard_image_types) |supported| {
+        if (!std.mem.eql(u8, media_type, supported)) continue;
+        const slash = std.mem.indexOfScalar(u8, supported, '/') orelse continue;
+        return supported[slash + 1 ..];
+    }
+    return "clipboard";
+}
+
+fn writeClipboardSnapshot(path: []const u8, bytes: []const u8) !void {
+    const zio = io_mod.getIo();
+    var file = try std.Io.Dir.createFileAbsolute(zio, path, .{
+        .truncate = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close(zio);
+    try file.writeStreamingAll(zio, bytes);
+    try file.sync(zio);
+}
+
+const ClipboardRunError = error{
+    ClipboardToolNotFound,
+    ClipboardProcessFailed,
+    OutOfMemory,
+    StreamTooLong,
+};
+
+/// Runs one clipboard command and returns its stdout on success. The caller
+/// owns the returned slice.
+fn runClipboardCapture(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    stdout_limit: std.Io.Limit,
+) ClipboardRunError![]u8 {
+    const result = std.process.run(alloc, io_mod.getIo(), .{
+        .argv = argv,
+        .stdout_limit = stdout_limit,
+        .stderr_limit = .limited(1024),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.ClipboardToolNotFound,
+        error.OutOfMemory => return error.OutOfMemory,
+        // The caller reads this as an oversized clipboard image.
+        error.StreamTooLong => return error.StreamTooLong,
+        // A missing display server, an empty selection, and a refused
+        // connection all surface here as a failed clipboard read.
+        else => return error.ClipboardProcessFailed,
+    };
+    defer alloc.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) {
+        alloc.free(result.stdout);
+        return error.ClipboardProcessFailed;
+    }
+    return result.stdout;
+}
+
+test "preferredClipboardImageType picks the first offered supported target" {
+    try std.testing.expectEqualStrings(
+        "image/png",
+        preferredClipboardImageType("text/plain\nimage/png\nimage/jpeg\n").?,
+    );
+    try std.testing.expectEqualStrings(
+        "image/jpeg",
+        preferredClipboardImageType("image/jpeg\nimage/png\n").?,
+    );
+}
+
+test "preferredClipboardImageType reads xclip comma separated targets" {
+    try std.testing.expectEqualStrings(
+        "image/png",
+        preferredClipboardImageType("TARGETS,image/png,text/plain\n").?,
+    );
+}
+
+test "preferredClipboardImageType ignores targets fx cannot attach" {
+    try std.testing.expect(preferredClipboardImageType("text/plain\ntext/html\n") == null);
+    try std.testing.expect(preferredClipboardImageType("") == null);
+    try std.testing.expect(preferredClipboardImageType("image/tiff\nimage/bmp\n") == null);
+}
+
+test "clipboardSnapshotName matches the selected media type" {
+    try std.testing.expectEqualStrings("png", clipboardSnapshotName("image/png"));
+    try std.testing.expectEqualStrings("jpeg", clipboardSnapshotName("image/jpeg"));
+    try std.testing.expectEqualStrings("webp", clipboardSnapshotName("image/webp"));
+    try std.testing.expectEqualStrings("clipboard", clipboardSnapshotName("image/tiff"));
+}
+
+test "linux clipboard backends build their read commands" {
+    var buffer: [6][]const u8 = undefined;
+    const wayland = linux_clipboard_backends[0].readArgv("image/png", &buffer);
+    try std.testing.expectEqualStrings("wl-paste", wayland[0]);
+    try std.testing.expectEqualStrings("--no-newline", wayland[1]);
+    try std.testing.expectEqualStrings("--type", wayland[2]);
+    try std.testing.expectEqualStrings("image/png", wayland[3]);
+    try std.testing.expectEqual(@as(usize, 4), wayland.len);
+
+    const x11 = linux_clipboard_backends[1].readArgv("image/png", &buffer);
+    try std.testing.expectEqualStrings("xclip", x11[0]);
+    try std.testing.expectEqualStrings("-o", x11[5]);
+    try std.testing.expectEqual(@as(usize, 6), x11.len);
+}
+
+fn loadMacosClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
         cleanupSnapshotDir(source_dir);

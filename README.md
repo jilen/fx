@@ -65,7 +65,9 @@ The interactive shell reports its state with the [Program Status Protocol (OSC 7
 
 ## Images
 
-Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
+Paste an image with `/paste`, attach one with `fx ask --image PATH`, or ask fx to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
+
+`/paste` reads the most recent image on your clipboard. macOS reads the system clipboard directly. On Linux it uses `wl-paste` from wl-clipboard under Wayland, or `xclip` under X11, so install one of those two tools to use `/paste` there.
 
 When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. fx does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
 

@@ -3,6 +3,7 @@ const result_store = @import("../../core/session/result_store.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
 
@@ -49,6 +50,16 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
     }
     const args = if (parsed.value.object.get("request")) |request| blk: {
+        if (request == .string) {
+            // The request arrived serialized to a string. Read it the same way
+            // the shell tool reads one, so a multi-line query or handle is not
+            // lost to its own escaping.
+            const object = tool_args.parseEncodedJsonObject(parsed.arena.allocator(), request.string) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") },
+            };
+            break :blk object;
+        }
         if (request != .object) {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
         }
@@ -84,7 +95,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"query\" must be a string") };
         }
         if (value.string.len > 0) {
-            input.selector = .{ .query = try ctx.allocator.dupe(u8, value.string) };
+            // Hoisted out of the union literal: Zig fills the destination as
+            // it evaluates the literal, so a `try` inside it would leave a
+            // query that `Input.deinit` then frees.
+            const query = try ctx.allocator.dupe(u8, value.string);
+            input.selector = .{ .query = query };
         }
     }
 
@@ -170,7 +185,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         };
         const queries: []const []const u8 = input.selector.search;
         const output = compactor.search(ctx.allocator, result_store.compactorStore(capability), queries) catch |err| return .{
-            .failure = try std.fmt.allocPrint(ctx.allocator, "Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
+            .failure = try ctx.allocator.print("Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
         };
         return .{ .success = output };
     }
@@ -263,13 +278,12 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
 
 fn formatReadFailure(alloc: Allocator, handle: []const u8, err: anyerror) ![]u8 {
     if (err == error.ResultHandleNotFound) {
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "read_tool_result failed for handle {s}: ResultHandleNotFound. No exact match exists in the active tool-result store; handles are session-scoped and must be copied exactly from the tool result preview.",
             .{handle},
         );
     }
-    return std.fmt.allocPrint(alloc, "read_tool_result failed for handle {s}: {s}", .{ handle, @errorName(err) });
+    return alloc.print("read_tool_result failed for handle {s}: {s}", .{ handle, @errorName(err) });
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
@@ -330,6 +344,42 @@ test "read_tool_result decodes nested model requests" {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result decodes a request the model serialized to a string" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
+    }
+
+    // A string that is not an object is still reported, not guessed at.
+    const bad = try decode(.{ .allocator = alloc }, "{\"request\":\"not json\"}");
+    switch (bad) {
+        .input => |value| {
+            value.deinit(alloc);
+            return error.TestUnexpectedDecodeFailure;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expectEqualStrings(
+                "read_tool_result field \"request\" must be an object",
+                failure,
+            );
+        },
     }
 }
 
@@ -564,7 +614,7 @@ test "large web_search result is previewed and available through read_tool_resul
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "<tool_result_preview") != null);
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "Use read_tool_result") != null);
 
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\",\"query\":\"needle\"}}", .{prepared.memory.output_handle.?});
+    const args_json = try alloc.print("{{\"handle\":\"{s}\",\"query\":\"needle\"}}", .{prepared.memory.output_handle.?});
     defer alloc.free(args_json);
     const decoded = try decode(.{ .allocator = alloc }, args_json);
     const input = switch (decoded) {
@@ -591,7 +641,7 @@ test "persisted provider search results remain readable" {
     const handle = try result_store.storeLargeResult(alloc, dir, "legacy_provider_call", "perplexity_search", "historical provider search result");
     defer alloc.free(handle);
 
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\"}}", .{handle});
+    const args_json = try alloc.print("{{\"handle\":\"{s}\"}}", .{handle});
     defer alloc.free(args_json);
     const decoded = try decode(.{ .allocator = alloc }, args_json);
     const input = switch (decoded) {

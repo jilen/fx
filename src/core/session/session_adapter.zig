@@ -18,9 +18,10 @@
 //!   ACP client's prompt and tool identities are settings (D46); hosted
 //!   terminal state lives in `~/.fx/terminal/{id}/` (D45). An older session
 //!   with a `~/.fx/session-files/{id}/` side folder moves on its first
-//!   writable open (D47, `tla/MoveSideFiles.tla`).
+//!   writable open (D47, `tests/tla/session_manager/MoveSideFiles.tla`).
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -32,7 +33,6 @@ const session_event = @import("session_event.zig");
 const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
-const session_usage = @import("session_usage.zig");
 const session_layout = @import("session_layout.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -41,6 +41,7 @@ const session_summary_codec = @import("session_summary_codec.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -51,9 +52,6 @@ const PieceKind = std.meta.Tag(Event);
 pub const files_dir_name = profile_paths.session_files_dir_name;
 /// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
-/// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
-/// v1's readers load only v1 sessions, so v2 markers live apart.
-pub const usage_markers_dir_name = "usage-recovery-v2";
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -122,7 +120,7 @@ fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime det
 }
 
 fn processId() i64 {
-    if (comptime builtin.os.tag == .wasi) return 0;
+    if (comptime builtin.target.os.tag == .wasi) return 0;
     return std.c.getpid();
 }
 
@@ -145,7 +143,7 @@ pub const Store = struct {
             break :blk try alloc.dupe(u8, home);
         };
         errdefer alloc.free(owned_home);
-        const root = try std.fs.path.join(alloc, &.{
+        const root = try std.Io.Dir.path.join(alloc, &.{
             home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
@@ -163,7 +161,7 @@ pub const Store = struct {
 
     /// `$HOME` from the environment.
     pub fn openFromEnv(alloc: Allocator) !Store {
-        return open(alloc, io_mod.getenv("HOME") orelse return error.HomeNotSet);
+        return open(alloc, io_mod.homeDir() orelse return error.HomeNotSet);
     }
 
     /// Every Session must be closed first.
@@ -175,10 +173,18 @@ pub const Store = struct {
     }
 
     /// `~/.fx/{name}`, or null when nothing has made it yet.
+    /// Every caller is about to change the folder, so an existing `~/.fx` is
+    /// made `0700` as every other fx writer makes it: one made by hand or an
+    /// install script keeps the default mode, and refusing it would refuse
+    /// every resume.
     fn openProfileFolder(store: *Store, name: []const u8) !?io_mod.VerifiedDir {
         var home = try openHome(store.home);
         defer home.close();
-        var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
+        _ = home.dir.statFile(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer fx.close();
         return io_mod.openVerifiedPrivateDirIfPresent(&fx, name);
     }
@@ -550,7 +556,6 @@ pub const Restored = struct {
     language: types.ConversationLanguage,
     preferences: ?session_codec.DurableSessionPreferences = null,
     permission_state: ?session_permission_state.State = null,
-    usage: ?session_usage.Snapshot = null,
     /// The stored title, generated or chosen by the user.
     title: ?[]u8 = null,
     created_at_ms: i64,
@@ -561,7 +566,6 @@ pub const Restored = struct {
         if (restored.title) |value| alloc.free(value);
         if (restored.preferences) |*value| value.deinit(alloc);
         if (restored.permission_state) |*value| value.deinit(alloc);
-        if (restored.usage) |*value| value.deinit(alloc);
         restored.* = undefined;
     }
 };
@@ -604,7 +608,7 @@ const BlobHost = struct {
     moved: std.StringHashMapUnmanaged(Hash) = .empty,
     /// The compactor's records by name (D50), loaded on open and kept
     /// since; `mutex` guards them.
-    records: std.StringArrayHashMapUnmanaged(Hash) = .empty,
+    records: std.array_hash_map.String(Hash) = .empty,
     /// Records kept since the last `compaction_records` line, which the
     /// next one lists.
     records_added: std.ArrayList(Hash) = .empty,
@@ -728,7 +732,7 @@ const BlobHost = struct {
         host.mutex.lockUncancelable(io);
         defer host.mutex.unlock(io);
         if (host.records_generation == host.records_written) return null;
-        var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        var map: std.array_hash_map.String([]const u8) = .empty;
         try map.ensureTotalCapacity(a, host.records.count());
         for (host.records.keys(), host.records.values()) |name, *hash| map.putAssumeCapacity(name, try a.dupe(u8, hash));
         var json: std.Io.Writer.Allocating = .init(a);
@@ -804,7 +808,7 @@ const BlobHost = struct {
         }
         const folder = movedFolder(kind) orelse return error.BlobNotFound;
         var key_buffer: [movedKeyMax]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
+        const key = std.mem.print(&key_buffer, "{s}/{s}", .{ folder, name }) catch return error.BlobNotFound;
         return host.moved.get(key) orelse error.BlobNotFound;
     }
 
@@ -914,11 +918,6 @@ pub const Session = struct {
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
-    /// A usage-recovery marker protects a checkpoint still waiting for the
-    /// profile ledger; it keeps its first time until nothing is pending.
-    usage_marked: bool = false,
-    /// Time of the newest usage checkpoint; each new one is later.
-    usage_at_ms: i64 = 0,
     /// A child's instructions as its `prefs` hold them (D34), owned; null
     /// for a root and for a child without any.
     instructions: ?[]u8 = null,
@@ -1047,7 +1046,7 @@ pub const Session = struct {
     }
 
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
-        const files_path = try std.fs.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
+        const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
@@ -1092,7 +1091,7 @@ pub const Session = struct {
     /// listed with the records it adds, in chunks as the move's are (D50).
     fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
         const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
-        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
         var refs: std.ArrayList([]const u8) = .empty;
         try refs.ensureTotalCapacity(a, due.added.len + 1);
         for (due.added) |*hash| refs.appendAssumeCapacity(hash);
@@ -1114,7 +1113,7 @@ pub const Session = struct {
 
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
     pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
-        return std.fs.path.join(alloc, &.{
+        return std.Io.Dir.path.join(alloc, &.{
             self.store.home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
@@ -1124,7 +1123,7 @@ pub const Session = struct {
     }
 
     /// Closes the session and frees the adapter. Every child thread of this
-    /// session must have joined (`tla/Wiring.tla` ParentOutlivesChildren).
+    /// session must have joined (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren).
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
@@ -1199,7 +1198,7 @@ pub const Session = struct {
 
     fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
-        const terminal_path = try std.fs.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
+        const terminal_path = try std.Io.Dir.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
@@ -1215,8 +1214,10 @@ pub const Session = struct {
         self.startedTurn();
     }
 
-    /// Opens a subagent child's turn as its work starts: a child streams
-    /// nothing, and its tools may store bodies before the commit (D44).
+    /// Opens the turn as its work starts. A subagent child streams nothing,
+    /// and its tools may store bodies before the commit (D44); an ACP prompt
+    /// opens it before the model is asked, so a disk that cannot take the
+    /// turn fails the prompt first.
     pub fn beginTurn(self: *Session) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1487,7 +1488,7 @@ pub const Session = struct {
         refs[0] = hash_copy;
         return .{
             .type = item_type,
-            .data = try std.fmt.allocPrint(a, "{{\"{s}\":\"{s}\"}}", .{ blob_ref_key, hash_copy }),
+            .data = try a.print("{{\"{s}\":\"{s}\"}}", .{ blob_ref_key, hash_copy }),
             .blobs = refs,
         };
     }
@@ -1696,67 +1697,6 @@ pub const Session = struct {
         return true;
     }
 
-    // -- usage ---------------------------------------------------------------
-
-    /// Saves a usage checkpoint with v1's marker rules: a checkpoint that
-    /// still owes the profile ledger is covered by a marker written first
-    /// (keeping the time of the first such checkpoint), and the marker goes
-    /// once a durable checkpoint owes nothing (`tla/Wiring.tla`
-    /// UsageNeverSilent).
-    pub fn persistUsage(self: *Session, snapshot: session_usage.Snapshot) !void {
-        const now_ms = @max(io_mod.milliTimestamp(), 0);
-        const at_ms = if (now_ms > self.usage_at_ms) now_ms else try std.math.add(i64, self.usage_at_ms, 1);
-        const pending = session_usage.needsProfileRecovery(snapshot);
-        if (pending and !self.usage_marked) {
-            try self.writeUsageMarker(at_ms);
-            self.usage_marked = true;
-        }
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const value = try encodeUsage(arena.allocator(), snapshot, at_ms);
-        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
-        self.usage_at_ms = at_ms;
-        if (pending) return;
-        // Before the first turn a `set` waits in memory, not on disk.
-        if (!self.saved()) return;
-        self.clearUsageMarker();
-        self.usage_marked = false;
-    }
-
-    fn writeUsageMarker(self: *Session, now_ms: i64) !void {
-        var dir = try self.openUsageMarkers();
-        defer dir.close();
-        var buffer: [48]u8 = undefined;
-        const content = try std.fmt.bufPrint(&buffer, "v1 {d}\n", .{now_ms});
-        // A full disk stops the turn here, before the model is asked, so it
-        // must read as one (D29) and not as a failed replace.
-        var cause: ?anyerror = null;
-        io_mod.durableReplaceVerifiedWithOps(self.alloc, &dir, self.id(), content, .{ .pre_rename_cause = &cause }) catch |err| {
-            if (cause) |stopped| if (storageCause(stopped)) |named| return named;
-            return err;
-        };
-    }
-
-    fn clearUsageMarker(self: *Session) void {
-        var dir = self.openUsageMarkers() catch |err| {
-            debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) });
-            return;
-        };
-        defer dir.close();
-        dir.dir.deleteFile(io_mod.getIo(), self.id()) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_trace.logf("session", "event=sessions_v2_usage_marker_kept session={s} err={s}", .{ self.id(), @errorName(err) }),
-        };
-    }
-
-    fn openUsageMarkers(self: *Session) !io_mod.VerifiedDir {
-        var home = try openHome(self.store.home);
-        defer home.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
-        defer fx.close();
-        return io_mod.openOrCreateVerifiedPrivateDir(&fx, usage_markers_dir_name);
-    }
-
     // -- resume --------------------------------------------------------------
 
     /// Rebuilds fx's history and settings from the open log (`restoreFrom`),
@@ -1777,11 +1717,6 @@ pub const Session = struct {
         self.first_title = null;
         if (self.root and state.title == null) {
             if (try deriveTitle(sa, restored.history)) |title| self.first_title = try self.alloc.dupe(u8, title);
-        }
-        if (state.usage) |raw| {
-            const checkpoint = try decodeUsage(sa, raw);
-            self.usage_at_ms = checkpoint.at_ms;
-            self.usage_marked = session_usage.needsProfileRecovery(checkpoint.snapshot);
         }
         if (state.language != null) {
             const owned = try self.alloc.dupe(u8, restored.language.view());
@@ -1847,11 +1782,12 @@ pub const Session = struct {
 
     // -- the move off the side folder (D47) -----------------------------------
 
-    /// Makes an older session one manager folder (D47, `tla/MoveSideFiles.tla`)
-    /// on its first writable open, then loads the map its old handles resolve
-    /// through. Every body in the side folder becomes a blob, the map from
-    /// each old name to its blob is one more blob, and one batch records the
-    /// map, every moved blob, and the client's settings from the old files.
+    /// Makes an older session one manager folder (D47,
+    /// `tests/tla/session_manager/MoveSideFiles.tla`) on its first writable
+    /// open, then loads the map its old handles resolve through. Every body
+    /// in the side folder becomes a blob, the map from each old name to its
+    /// blob is one more blob, and one batch records the map, every moved
+    /// blob, and the client's settings from the old files.
     /// Then the terminal folder moves to `~/.fx/terminal/{id}` and the side
     /// folder goes. Each step can be repeated, so a crash at any point
     /// redoes the move on the next open.
@@ -1878,20 +1814,20 @@ pub const Session = struct {
     }
 
     /// Every step of the move but the side folder's removal, in the order
-    /// `tla/MoveSideFiles.tla` checks; returns how many bodies moved.
+    /// `tests/tla/session_manager/MoveSideFiles.tla` checks; returns how many bodies moved.
     fn moveOut(self: *Session, side: *io_mod.VerifiedDir) !usize {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
 
-        var moved: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+        var moved: std.array_hash_map.String([]const u8) = .empty;
         for (moved_body_folders) |folder| try self.moveFolder(a, side, folder, &moved);
         var map_json: std.Io.Writer.Allocating = .init(a);
         try std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
         const map_hash = try a.dupe(u8, &(try self.handle.putBlob(map_json.written())));
 
         var events: std.ArrayList(sm.Event) = .empty;
-        const value = try std.fmt.allocPrint(a, "{{\"map\":\"{s}\"}}", .{map_hash});
+        const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
         // One line per chunk of blobs keeps each line well under the limit;
         // the last one names the map, so the value is the same on each.
         var refs: std.ArrayList([]const u8) = .empty;
@@ -1926,7 +1862,7 @@ pub const Session = struct {
     /// Puts each regular file of `side/{folder}` as a blob and records it
     /// under `{folder}/{name}`. Anything else there is not fx's and is left
     /// for the side folder's removal, with a trace.
-    fn moveFolder(self: *Session, a: Allocator, side: *io_mod.VerifiedDir, folder: []const u8, moved: *std.StringArrayHashMapUnmanaged([]const u8)) !void {
+    fn moveFolder(self: *Session, a: Allocator, side: *io_mod.VerifiedDir, folder: []const u8, moved: *std.array_hash_map.String([]const u8)) !void {
         const io = io_mod.getIo();
         var dir = side.dir.openDir(io, folder, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -1943,7 +1879,7 @@ pub const Session = struct {
             defer file.close(io);
             const stat = try file.stat(io);
             const hash = try self.handle.putBlobFile(file, stat.size);
-            const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ folder, entry.name });
+            const key = try a.print("{s}/{s}", .{ folder, entry.name });
             try moved.put(a, key, try a.dupe(u8, &hash));
         }
     }
@@ -2263,7 +2199,6 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
     if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
     if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
-    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
     return restored;
 }
 
@@ -2355,13 +2290,11 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
             .total_input_tokens = 0,
             .total_output_tokens = 0,
             .permission_state = restored.permission_state orelse .{},
-            .usage = restored.usage,
         },
         .title = restored.title,
     };
     restored.history = &.{};
     restored.permission_state = null;
-    restored.usage = null;
     restored.title = null;
     return resumed;
 }
@@ -2682,119 +2615,18 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
     };
 }
 
-// ---------------------------------------------------------------------------
-// Usage recovery: what the profile's readers need from v2 sessions
-
-/// A v2 session's usage-recovery marker and its newest usage checkpoint,
-/// read without the session's lock. Owns everything.
-pub const MarkedUsage = struct {
-    id: []u8,
-    /// Null when the session or its checkpoint cannot be read.
-    snapshot: ?session_usage.Snapshot,
-    /// When the checkpoint was written.
-    at_ms: i64 = 0,
-    protected_updated_at_ms: ?i64,
-    marker_modified_at_ns: i128,
-
-    pub fn deinit(marked: *MarkedUsage, alloc: Allocator) void {
-        alloc.free(marked.id);
-        if (marked.snapshot) |*snapshot| snapshot.deinit(alloc);
-        marked.* = undefined;
-    }
-};
-
-const max_usage_markers: usize = 512;
-
-/// Every v2 usage-recovery marker under `home`, with v1's validation.
-pub fn collectMarkedUsage(alloc: Allocator, home: []const u8) !std.ArrayList(MarkedUsage) {
-    var list: std.ArrayList(MarkedUsage) = .empty;
-    errdefer {
-        for (list.items) |*entry| entry.deinit(alloc);
-        list.deinit(alloc);
-    }
-    const path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, usage_markers_dir_name });
-    defer alloc.free(path);
-    var markers = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return list,
-        else => return err,
-    } };
-    defer markers.close();
-    var store = try Store.open(alloc, home);
-    defer store.deinit(alloc);
-    var it = markers.dir.iterate();
-    while (try it.next(io_mod.getIo())) |entry| {
-        if (entry.kind != .file or list.items.len == max_usage_markers) return error.InvalidUsageRecoveryIndex;
-        const protected = session_store.validateUsageRecoveryMarker(&markers, entry.name) catch return error.InvalidUsageRecoveryIndex;
-        const stat = try markers.dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-        const id = try alloc.dupe(u8, entry.name);
-        errdefer alloc.free(id);
-        const checkpoint = newestUsage(&store, alloc, id) catch |err| blk: {
-            if (err == error.OutOfMemory) return err;
-            debug_trace.logf("usage", "event=sessions_v2_usage_unreadable session={s} err={s}", .{ id, @errorName(err) });
-            break :blk null;
-        };
-        try list.append(alloc, .{
-            .id = id,
-            .snapshot = if (checkpoint) |c| c.snapshot else null,
-            .at_ms = if (checkpoint) |c| c.at_ms else 0,
-            .protected_updated_at_ms = protected,
-            .marker_modified_at_ns = stat.mtime.nanoseconds,
-        });
-    }
-    return list;
-}
-
-/// The newest `set usage`, or the usage in the newest snapshot, reading
-/// back from the end without the session's lock.
-fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoint {
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-    var from: sm.From = .end;
-    while (true) {
-        var page = try store.manager.read(sa, id, from, .backward, replay_page_lines);
-        defer page.deinit();
-        for (page.entries) |entry| {
-            const body = entry.body orelse continue;
-            switch (body) {
-                .set => |setting| if (setting.key == .usage) return try decodeUsage(alloc, setting.value),
-                .snapshot => |snapshot| {
-                    const state = try std.json.parseFromSliceLeaky(std.json.Value, sa, snapshot.state, .{});
-                    if (state != .object) return error.InvalidUsageCheckpoint;
-                    const usage = state.object.get("usage") orelse return null;
-                    return try decodeUsageValue(alloc, usage);
-                },
-                else => {},
-            }
-        }
-        from = .{ .at = page.next orelse return null };
-    }
-}
-
 /// v1's error names for a failed resume, so every host reports the same
 /// error whichever backend is on.
 /// Whether a failed write may still have reached the log: after any I/O
 /// fault, whatever its cause, durability is unknown (D29).
 pub fn writeMayHaveLanded(err: anyerror) bool {
-    inline for (@typeInfo(sm.IoFault).error_set.?) |fault| {
-        if (err == @field(sm.IoFault, fault.name)) return true;
+    inline for (comptime @typeInfo(sm.IoFault).error_set.error_names.?) |fault_name| {
+        if (err == @field(sm.IoFault, fault_name)) return true;
     }
     return false;
 }
 
 const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
-
-/// The storage causes a host names (D29), from an OS error; null for any
-/// other error.
-fn storageCause(err: anyerror) ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig } {
-    return switch (err) {
-        error.NoSpaceLeft => error.NoSpaceLeft,
-        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
-        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
-        error.FileTooBig => error.FileTooBig,
-        else => null,
-    };
-}
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -2871,8 +2703,8 @@ fn itemType(kind: PieceKind) ?[]const u8 {
 }
 
 fn pieceKind(item_type: []const u8) ?PieceKind {
-    inline for (@typeInfo(PieceKind).@"enum".fields) |field| {
-        const kind: PieceKind = @enumFromInt(field.value);
+    inline for (@typeInfo(PieceKind).@"enum".field_values) |field_value| {
+        const kind: PieceKind = @fromBackingInt(@intCast(field_value));
         if (itemType(kind)) |name| {
             if (std.mem.eql(u8, name, item_type)) return kind;
         }
@@ -2971,10 +2803,10 @@ const WireUser = struct {
 
         pub fn jsonStringify(self: WireImage, writer: *std.json.Stringify) !void {
             try writer.beginObject();
-            inline for (std.meta.fields(WireImage)) |field| {
-                if (!std.mem.eql(u8, field.name, "source_ref") or self.source_ref != null) {
-                    try writer.objectField(field.name);
-                    try writer.write(@field(self, field.name));
+            inline for (@typeInfo(WireImage).@"struct".field_names) |field_name| {
+                if (!std.mem.eql(u8, field_name, "source_ref") or self.source_ref != null) {
+                    try writer.objectField(field_name);
+                    try writer.write(@field(self, field_name));
                 }
             }
             try writer.endObject();
@@ -3091,32 +2923,6 @@ fn decodeLanguage(arena: Allocator, raw: []const u8) !types.ConversationLanguage
     return session_codec.parseConversationLanguage(tag);
 }
 
-/// `{"at_ms":N,"snapshot":...}`: the snapshot as v1's usage file holds it.
-fn encodeUsage(alloc: Allocator, snapshot: session_usage.Snapshot, at_ms: i64) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.print("{{\"at_ms\":{d},\"snapshot\":", .{at_ms});
-    try session_usage.writeRichSnapshot(&out.writer, snapshot);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-const UsageCheckpoint = struct { snapshot: session_usage.Snapshot, at_ms: i64 };
-
-fn decodeUsage(alloc: Allocator, raw: []const u8) !UsageCheckpoint {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    return decodeUsageValue(alloc, parsed.value);
-}
-
-fn decodeUsageValue(alloc: Allocator, value: std.json.Value) !UsageCheckpoint {
-    if (value != .object) return error.InvalidUsageCheckpoint;
-    const at = value.object.get("at_ms") orelse return error.InvalidUsageCheckpoint;
-    if (at != .integer) return error.InvalidUsageCheckpoint;
-    const snapshot = value.object.get("snapshot") orelse return error.InvalidUsageCheckpoint;
-    return .{ .snapshot = try session_usage.parseSnapshotValue(alloc, snapshot), .at_ms = at.integer };
-}
-
 /// The title v1 derives from the first prompt of `history`, if any.
 fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u8 {
     const display = session_display_metadata.deriveFromHistory(arena, history) catch return null;
@@ -3130,8 +2936,8 @@ fn deriveTitle(arena: Allocator, history: []const types.HistoryTurn) !?[]const u
 const testing = std.testing;
 
 test "every piece kind but checkpoints maps to one item type and back" {
-    inline for (@typeInfo(PieceKind).@"enum".fields) |field| {
-        const kind: PieceKind = @enumFromInt(field.value);
+    inline for (@typeInfo(PieceKind).@"enum".field_values) |field_value| {
+        const kind: PieceKind = @fromBackingInt(@intCast(field_value));
         if (itemType(kind)) |name| {
             try testing.expectEqual(@as(?PieceKind, kind), pieceKind(name));
         } else {
@@ -3403,7 +3209,7 @@ test "a copy of a parent's children frees every part when memory runs out" {
             freeChildren(alloc, try session.children(alloc));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.run, .{parent});
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, Copy.run, .{parent});
 }
 
 fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usize {
@@ -3957,7 +3763,7 @@ test "resume refuses a session whose compaction line is damaged" {
     // One byte of the summary changes, so its line fails its check. Open
     // reads past it: a snapshot follows every compaction.
     const io = io_mod.getIo();
-    const log_path = try std.fs.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
     const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
@@ -4039,45 +3845,6 @@ test "a piece above the inline limit goes to a blob and comes back whole" {
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     try testing.expectEqualStrings(big, restored.history[0].assistant.assistant);
-}
-
-test "usage is durable before its marker goes, and resume restores it" {
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var model = "m".*;
-    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
-    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(testing.allocator);
-    var snapshot = try usage.snapshot(testing.allocator);
-    defer snapshot.deinit(testing.allocator);
-    try s.persistUsage(snapshot);
-    const id = try testing.allocator.dupe(u8, s.id());
-    defer testing.allocator.free(id);
-    // Nothing left to publish: the marker is gone.
-    var markers = try t.tmp.dir.openDir(io_mod.getIo(), ".fx/" ++ usage_markers_dir_name, .{});
-    defer markers.close(io_mod.getIo());
-    try testing.expectError(error.FileNotFound, markers.statFile(io_mod.getIo(), id, .{}));
-    s.close();
-
-    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
-    defer r.close();
-    var restored = try r.restore(testing.allocator);
-    defer restored.deinit(testing.allocator);
-    try testing.expect(restored.usage != null);
-}
-
-test "a usage marker that cannot be written names a storage cause (D29)" {
-    // The real write is proven on a full disk end to end; opening the
-    // markers folder makes it private again, so a unit test cannot block it.
-    const Cause = ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
-    try testing.expectEqual(@as(Cause, error.NoSpaceLeft), storageCause(error.NoSpaceLeft));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.AccessDenied));
-    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.PermissionDenied));
-    try testing.expectEqual(@as(Cause, error.ReadOnlyFileSystem), storageCause(error.ReadOnlyFileSystem));
-    try testing.expectEqual(@as(Cause, error.FileTooBig), storageCause(error.FileTooBig));
-    try testing.expectEqual(@as(Cause, null), storageCause(error.InputOutput));
 }
 
 test "a failed resume reports v1's error names" {
@@ -4182,7 +3949,7 @@ test "-c resumes the session this host last opened" {
 }
 
 fn pathExists(t: *TestHome, parts: []const []const u8) bool {
-    const path = std.fs.path.join(testing.allocator, parts) catch return false;
+    const path = std.Io.Dir.path.join(testing.allocator, parts) catch return false;
     defer testing.allocator.free(path);
     t.tmp.dir.access(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return false;
     return true;
@@ -4365,7 +4132,7 @@ test "recover copies the folders outside the manager, never a link, and says whe
     defer recovered.deinit(testing.allocator);
     try testing.expect(!recovered.files_complete);
     try testing.expectEqual(@as(usize, 1), recovered.history_len);
-    const copy = try std.fs.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, recovered.id });
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, recovered.id });
     defer testing.allocator.free(copy);
     var dir = try t.tmp.dir.openDir(io, copy, .{});
     defer dir.close(io);
@@ -4384,6 +4151,24 @@ test "recover copies the folders outside the manager, never a link, and says whe
     defer copied.deinit(testing.allocator);
     try testing.expectEqualStrings("q", copied.state.history[0].assistant.user.text);
     try testing.expectError(error.SessionNotFound, recover(&t.store, testing.allocator, "NoSuchSession1"));
+}
+
+test "a resume makes a hand-made ~/.fx private instead of refusing the session" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try OldSideFolder.commitTurn(&t, s);
+    s.close();
+    try t.tmp.dir.setFilePermissions(io_mod.getIo(), ".fx", .fromMode(0o755), .{});
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    r.close();
+    const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx", .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 /// The side folder an older v2 session kept (D27), with one body of each
@@ -4421,7 +4206,7 @@ const OldSideFolder = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&png, &digest, .{});
         var digest_hex = std.fmt.bytesToHex(digest, .lower);
-        const snapshot_path = try std.fs.path.join(testing.allocator, &.{ t.home, ".fx", files_dir_name, s.id(), "images", image_name });
+        const snapshot_path = try std.Io.Dir.path.join(testing.allocator, &.{ t.home, ".fx", files_dir_name, s.id(), "images", image_name });
         defer testing.allocator.free(snapshot_path);
         var images = [_]types.ImageAttachment{.{
             .id = 1,
@@ -4727,7 +4512,7 @@ test "v2 image source refs reject malformed metadata" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    for ([_][]const u8{ "", "bad\nref", "x" ** 513 }) |source_ref| {
+    for ([_][]const u8{ "", "bad\nref", text_utils.repeat("x", 513) }) |source_ref| {
         const images = [_]types.ImageAttachment{.{
             .id = 1,
             .path = @constCast("image.png"),
@@ -4742,8 +4527,8 @@ test "v2 image source refs reject malformed metadata" {
 }
 
 test "only the adapter imports the session manager" {
-    // Set by `zig build test`; tests read the process environment directly.
-    const root = std.mem.span(std.c.getenv("FX_TEST_SOURCE_ROOT") orelse return error.SkipZigTest);
+    // Set by `zig build test`.
+    const root = @import("test_paths").source_root;
     const io = io_mod.getIo();
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);

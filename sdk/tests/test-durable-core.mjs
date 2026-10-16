@@ -3,18 +3,22 @@
 // `createDurableAgentFactory` documents is all a harness needs, and is the
 // smallest example of one.
 //
-//   node sdk/tests/test-durable-core.mjs [memory|local|world]
+//   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
 import { strict as assert } from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDurableAgentFactory, memory } from "../durable.js";
+import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
 const { local } = durabilityKind === "local" ? await import("../durable/local.mjs") : {};
 // "world": the app's own World through world(); see app-world.mjs.
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
+// "queue": a World whose queue delivers as Vercel Queues does, which shows
+// whether a worker lives, so leases are held without renewals; see
+// queue-world.mjs.
+const { queueWorldAt, closeQueueWorlds } = durabilityKind === "world" || durabilityKind === "queue" ? await import("./queue-world.mjs") : {};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const dirs = [];
@@ -38,8 +42,10 @@ const stopsAfterEnd = new Set(["omega"]);
 const brittle = "brittle";
 const shattered = "shattered";
 const endsLate = new Set(["late"]);
-// How many engines the scripted harness opened.
+// How many engines the scripted harness opened, and how long each takes to
+// close.
 const opened = { count: 0 };
+const closeDelay = { ms: 0 };
 const harnessStopped = (message) => Object.assign(new Error(message), { code: "FX_HARNESS_STOPPED" });
 // Steps that wait until a test lets them go, by text.
 const holds = new Map();
@@ -148,8 +154,12 @@ function scriptedHarness({ steps = 3 } = {}) {
         settled: async () => {},
         saveCheckpoint: async () => {},
         exportCheckpoint: async () => encoder.encode(JSON.stringify(records.filter((record) => record.word !== undefined).map((record) => record.word))),
-        // Closing waits for the records still landing, as fx's engine does.
-        close: async () => { await Promise.allSettled([...landing]); },
+        // Closing waits for the records still landing, as fx's engine does,
+        // and takes `closeDelay.ms` more, as an engine that saves on close.
+        close: async () => {
+          await Promise.allSettled([...landing]);
+          if (closeDelay.ms > 0) await sleep(closeDelay.ms);
+        },
       };
     },
   });
@@ -208,10 +218,24 @@ function chain(before, next) {
 
 const createAgent = createDurableAgentFactory({ harness: scriptedHarness(), defaultDurability: async () => memory(), name: "createScriptedAgent" });
 
+// Agents that record which of them opened each session's engine, by `tag`.
+const openedBy = [];
+const createTaggedAgent = createDurableAgentFactory({
+  harness: ({ tag }) => {
+    const plugged = scriptedHarness()();
+    return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
+  },
+  defaultDurability: async () => memory(),
+  name: "createTaggedAgent",
+});
+const openersOf = (sessionId) => [...new Set(openedBy.filter(([, id]) => id === sessionId).map(([tag]) => tag))];
+
 async function durabilityFor(options = {}) {
   if (durabilityKind === "memory") return memory(options);
   const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
   dirs.push(dir);
+  // A queue-held lease needs a deadline: a function's, ten minutes away.
+  if (durabilityKind === "queue") return (await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, ...options })).durability;
   return durabilityKind === "world" ? appWorldAt(dir, options) : local({ dir, ...options });
 }
 
@@ -311,6 +335,76 @@ test("two agents prompting one session run its turns one at a time, in one histo
   }
   await first.close();
   await second.close();
+});
+
+test("agents with different names each run only their own sessions' turns", async () => {
+  const durability = await durabilityFor();
+  // Each agent's own prompts reach it directly, never through the other.
+  const forwarded = [];
+  const onEvent = (event) => { if (event.type === "session.forwarded") forwarded.push(event); };
+  const support = createTaggedAgent({ durability, name: "support", tag: "support", onEvent });
+  const coding = createTaggedAgent({ durability, name: "coding", tag: "coding", onEvent });
+  assert.equal(support.name, "support");
+  const ours = support.session();
+  const theirs = coding.session();
+  for (let round = 0; round < 4; round += 1) {
+    const [a, b] = await Promise.all([textOf(ours.prompt(`s${round}`)), textOf(theirs.prompt(`c${round}`))]);
+    assert.equal(a.text, `s${round}-0 s${round}-1 s${round}-2`);
+    assert.equal(b.text, `c${round}-0 c${round}-1 c${round}-2`);
+  }
+  assert.deepEqual(openersOf(ours.id), ["support"]);
+  assert.deepEqual(openersOf(theirs.id), ["coding"]);
+  assert.deepEqual(forwarded, [], "every delivery went to the agent its message names");
+  await support.close();
+  await coding.close();
+});
+
+test("a prompt to another agent's session runs on that session's agent", async () => {
+  const durability = await durabilityFor();
+  const events = [];
+  const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+  const coding = createTaggedAgent({ durability, name: "coding", tag: "coding", onEvent: (event) => events.push(event) });
+  const session = support.session();
+  await textOf(session.prompt("first"));
+  const { text, result } = await textOf(coding.session(session.id).prompt("second"));
+  assert.equal(text, "second-0 second-1 second-2");
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(openersOf(session.id), ["support"]);
+  assert.ok(events.some((event) => event.type === "session.forwarded" && event.sessionId === session.id && event.agent === "support"), "the sender says it sent the message on");
+  await support.close();
+  await coding.close();
+});
+
+if (durabilityKind === "local") {
+  // local() makes each agent a World of its own, which delivers only the
+  // messages it queued, as world-local does.
+  test("agents on one durability, each on a World of its own, still send each other's prompts on", async () => {
+    const durability = await durabilityFor();
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const coding = createTaggedAgent({ durability, name: "coding", tag: "coding" });
+    const ours = support.session();
+    const theirs = coding.session();
+    await Promise.all([textOf(ours.prompt("one")), textOf(theirs.prompt("two"))]);
+    const [a, b] = await Promise.all([textOf(coding.session(ours.id).prompt("three")), textOf(support.session(theirs.id).prompt("four"))]);
+    assert.equal(a.text, "three-0 three-1 three-2");
+    assert.equal(b.text, "four-0 four-1 four-2");
+    assert.deepEqual(openersOf(ours.id), ["support"]);
+    assert.deepEqual(openersOf(theirs.id), ["coding"]);
+    await support.close();
+    await coding.close();
+  });
+}
+
+test("an agent's name defaults to default, and a malformed one is refused", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  assert.equal(agent.name, "default");
+  await agent.close();
+  for (const name of ["", "two words", "-dash", "x".repeat(65), 7, null]) {
+    assert.throws(() => createAgent({ name }), /createScriptedAgent\(\) name must be 1 to 64 letters/, `refuses ${JSON.stringify(name)}`);
+  }
+  const named = createAgent({ name: "a.b_c-9" });
+  assert.equal(named.name, "a.b_c-9");
+  await named.close();
 });
 
 test("a retried message runs its turn once", async () => {
@@ -707,6 +801,185 @@ test("a World stream that takes forever to cancel holds no view or retry", async
   await agent.close();
 });
 
+test("a prompt sent when the last turn ends starts without waiting for its engine to shut down", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  closeDelay.ms = 1500;
+  try {
+    assert.equal((await session.prompt("first", { messageId: "turn-first" }).result).stopReason, "end_turn");
+    const sent = performance.now();
+    const { text, result } = await textOf(session.prompt("second", { messageId: "turn-second" }));
+    const took = performance.now() - sent;
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "second-0 second-1 second-2");
+    assert.ok(took < 1000, `the next turn waited ${took.toFixed(0)}ms for the last one's engine to shut down`);
+  } finally {
+    closeDelay.ms = 0;
+  }
+  // The agent still waits for every engine it started on close.
+  await agent.close();
+});
+
+// A World durability that tells `onRead(from)` where each stream read starts.
+function watchingReads(base, onRead) {
+  return {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const get = world.streams.get.bind(world.streams);
+      const streams = Object.assign(Object.create(world.streams), {
+        get(runId, name, from, ...rest) {
+          onRead(from);
+          return get(runId, name, from, ...rest);
+        },
+      });
+      return Object.assign(Object.create(world), { streams });
+    },
+  };
+}
+
+if (durabilityKind === "queue") {
+  test("on a World with the in-band fence, a worker's chained entries go in-band, and one that continues a superseded head is refused before it lands", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fence-"));
+    dirs.push(dir);
+    const { durability, fence } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, inBandFence: true });
+    const agent = createAgent({ durability });
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("omicron"))).result.stopReason, "end_turn");
+    for (let tries = 0; internals.liveWorkers() > 0; tries += 1) {
+      assert.ok(tries < 200, "the worker never let go");
+      await sleep(10);
+    }
+    // The worker's chained entries went in-band, each expecting the count
+    // the one before it left, from the run's creation on; its input, turn end
+    // and any checkpoint went out-of-band.
+    const writes = fence.creates
+      .filter((create) => create.runId === session.id && create.data?.eventType === "step_created")
+      .map((create) => ({ entry: JSON.parse(decoder.decode(create.data.eventData.input)), params: create.params ?? {} }));
+    const isChained = ({ entry }) => entry.k === "lease" || entry.k === "record" || entry.k === "release";
+    const chained = writes.filter(isChained);
+    assert.ok(chained.length >= 3, JSON.stringify(writes.map(({ entry }) => entry.k)));
+    assert.deepEqual(chained.map(({ params }) => [params.inBand, params.expectedSeqInBand]), chained.map((_, index) => [true, 1 + index]));
+    assert.deepEqual(writes.filter((write) => !isChained(write)).map(({ params }) => params.inBand), writes.filter((write) => !isChained(write)).map(() => undefined));
+    // Two workers that read the same head both continue it: the World takes
+    // the first, and refuses the second before any of it is written.
+    const first = await internals.openLog(session.id);
+    const second = await internals.openLog(session.id);
+    const { head } = foldSessionLog(await first.read());
+    assert.equal(foldSessionLog(await second.read()).head, head);
+    const lease = (holder) => ({ k: "lease", a: head, holder, epoch: 90, expiresAt: Date.now() + 60_000, pid: 1, host: "test" });
+    const won = await first.append(lease("wkr_first"));
+    await assert.rejects(second.append(lease("wkr_second")), (error) => error.code === "FX_FENCED");
+    const continuing = (await first.read()).filter(({ entry }) => entry.k === "lease" && entry.a === head).map(({ entry }) => entry.holder);
+    assert.deepEqual(continuing, ["wkr_first"], "the refused lease never landed");
+    // The worker that won goes on from its own write.
+    await first.append({ k: "release", a: won, holder: "wkr_first" });
+    assert.equal(foldSessionLog(await second.read()).lastLease, null);
+    await agent.close();
+  });
+
+  test("a worker that read the head while its in-band count was settling still continues it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fence-settle-"));
+    dirs.push(dir);
+    const { durability } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, inBandFence: { settleMs: 300 } });
+    const agent = createAgent({ durability });
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("pi"))).result.stopReason, "end_turn");
+    for (let tries = 0; internals.liveWorkers() > 0; tries += 1) {
+      assert.ok(tries < 200, "the worker never let go");
+      await sleep(10);
+    }
+    const first = await internals.openLog(session.id);
+    const { head } = foldSessionLog(await first.read());
+    const lease = { k: "lease", a: head, holder: "wkr_first", epoch: 90, expiresAt: Date.now() + 60_000, pid: 1, host: "test" };
+    const writing = first.append(lease);
+    // A second worker reads after the lease is published, but before the
+    // World counts it.
+    const second = await internals.openLog(session.id);
+    let seen = null;
+    for (let tries = 0; seen === null; tries += 1) {
+      assert.ok(tries < 100, "the lease never showed");
+      const { head: now } = foldSessionLog(await second.read());
+      if (now !== head) seen = now;
+      else await sleep(5);
+    }
+    assert.equal(seen, await writing);
+    // Nothing else continued the lease, so the release goes through.
+    const released = await second.append({ k: "release", a: seen, holder: "wkr_first" });
+    assert.equal(foldSessionLog(await first.read()).head, released);
+    // One that continues a head another worker continued is still refused.
+    await assert.rejects(first.append({ k: "release", a: seen, holder: "wkr_first" }), (error) => error.code === "FX_FENCED");
+    await agent.close();
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("where the queue holds sessions, a prompt runs in the request that took it, and its queued message waits as a backstop", async () => {
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    for (const [input, maxDurationMs] of [["nu", 60_000], ["xi3", 300]]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-"));
+      dirs.push(dir);
+      const waited = [];
+      const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const agent = createAgent({ durability });
+      const session = agent.session();
+      // With the short deadline, a step outlasts the request.
+      if (maxDurationMs < 1000) {
+        const slow = holdStep(`${input}-1`);
+        void slow.holding.then(() => setTimeout(slow.release, 600));
+      }
+      const { text, result } = await textOf(session.prompt(input, { messageId: `turn-${input}` }));
+      assert.equal(result.stopReason, "end_turn");
+      assert.equal(text, [0, 1, 2].map((step) => `${input}-${step}`).join(" "));
+      // The queue's first copy of the prompt is the backstop, and the turn
+      // ran before any delivery of it.
+      const [backstop, ...after] = broker.sent.filter((message) => message.payload?.input?.messageId === `turn-${input}`);
+      assert.equal(backstop.attempt, 0, "the backstop waited");
+      if (maxDurationMs < 1000) {
+        assert.ok(after.length > 0, "a turn longer than the request went on in a fresh message");
+      } else {
+        assert.equal(after.length, 0, "the request ran the whole turn");
+        // The request's lease names the backstop, so if the request had died,
+        // the backstop's delivery would take the session over.
+        assert.deepEqual((await internals(agent).lastLease(session.id)).delivery, { messageId: backstop.id, attempt: 0 });
+      }
+      assert.equal(waited.length, 1, "the request's run went to waitUntil");
+      assert.equal(await waited[0], undefined);
+      for (let tries = 0; internals(agent).liveWorkers() > 0; tries += 1) {
+        assert.ok(tries < 200, "the request's worker never let go");
+        await sleep(10);
+      }
+      // The backstop, delivered at last, finds nothing to do.
+      const ranBefore = ran.length;
+      broker.lapse(backstop);
+      for (let tries = 0; broker.held(() => true).some((message) => message.id === backstop.id); tries += 1) {
+        assert.ok(tries < 200, "the backstop was never acknowledged");
+        await sleep(10);
+      }
+      assert.equal(backstop.attempt, 1);
+      assert.equal(ran.length, ranBefore, "the backstop ran nothing");
+      assert.deepEqual(JSON.parse(decoder.decode(await session.checkpoint())), [0, 1, 2].map((step) => `${input}-${step}`));
+      await agent.close();
+    }
+  });
+}
+
+test("a reconnect reads the stream from its cursor's line, not its start", async () => {
+  if (durabilityKind === "memory") return;
+  const starts = [];
+  const agent = createAgent({ durability: watchingReads(await durabilityFor(), (from) => starts.push(from)) });
+  const session = agent.session();
+  assert.equal((await session.prompt("rho", { messageId: "turn-rho" }).result).stopReason, "end_turn");
+  const lines = await readLines(session.stream(0), 8);
+  starts.length = 0;
+  const later = await readLines(session.stream(lines[2].cursor), 8);
+  assert.deepEqual(later, lines.slice(3), "a reconnect from a cursor shows the lines after it");
+  assert.deepEqual(starts, [lines[2].cursor - 1], "the read starts at the cursor's own line");
+  await agent.close();
+});
+
 test("each prompt's turn runs with its own caller's context, resumed or not", async () => {
   const seen = [];
   const contextual = createDurableAgentFactory({
@@ -853,8 +1126,16 @@ test("world() checks its options, and an agent names it among the durabilities",
   assert.throws(() => world({}, { leaseMs: 999 }), /world\(\) leaseMs must be an integer of at least 1000/);
   assert.throws(() => world({}, { leaseMs: 1500.5 }), /world\(\) leaseMs must be an integer of at least 1000/);
   assert.throws(() => world({}, { name: "pg", queueDurable: "yes" }), /pg\(\) queueDurable must be a boolean/);
+  assert.throws(() => world({}, { name: "pg", queueLeases: 1 }), /pg\(\) queueLeases must be a boolean/);
   assert.throws(() => world({}, { name: "pg", livenessKnown: true }), /pg\(\) livenessKnown needs alive\(\)/);
   assert.throws(() => world({}, { alive: true }), /world\(\) alive must be a function/);
+  assert.throws(() => world({}, { name: "pg", runInRequest: true }), /pg\(\) runInRequest needs queueLeases/);
+  assert.throws(() => world({}, { waitUntil: true }), /world\(\) waitUntil must be a function/);
+  assert.deepEqual([world({}).runInRequest, world({}, { queueLeases: true }).runInRequest, world({}, { queueLeases: true, runInRequest: false }).runInRequest], [false, true, false]);
+  // vercel() runs prompts in the request unless its leases are renewed.
+  const { vercel } = await import("../durable/vercel.mjs");
+  assert.deepEqual([vercel().runInRequest, vercel({ leaseMs: 15_000 }).runInRequest], [true, false]);
+  assert.equal(typeof vercel().waitUntil, "function");
   assert.throws(() => createAgent({ durability: {} }), /durability must come from memory\(\), local\(\), vercel\(\) or world\(\)/);
 });
 
@@ -889,6 +1170,263 @@ if (durabilityKind === "world") {
   });
 }
 
+// A World durability whose session stream reads are counted.
+function countingStreamReads(durability) {
+  const counts = { reads: 0 };
+  const worldOf = durability.world;
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await worldOf();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          if (key !== "get") return bound(target, key);
+          return (...args) => {
+            counts.reads += 1;
+            return target.get(...args);
+          };
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, counts];
+}
+
+if (durabilityKind !== "memory") {
+  test("a prompt nobody reads holds no read of the session stream, and a later reader still sees its turn", async () => {
+    const [durability, counts] = countingStreamReads(await durabilityFor());
+    const agent = createAgent({ durability });
+    const turn = agent.session().prompt("alpha", { messageId: "turn-a" });
+    const { sessionId } = await turn.accepted;
+    // The turn runs to its end with nobody reading it.
+    let words = [];
+    for (let waited = 0; words.length < 3 && waited < 5000; waited += 20) {
+      await sleep(20);
+      words = JSON.parse(decoder.decode(await agent.session(sessionId).checkpoint()));
+    }
+    assert.deepEqual(words, ["alpha-0", "alpha-1", "alpha-2"]);
+    assert.equal(counts.reads, 0, "nothing read the session stream");
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "alpha-0 alpha-1 alpha-2", "a reader that comes later sees the whole turn");
+    assert.ok(counts.reads > 0, "reading the view read the stream");
+    await agent.close();
+  });
+}
+
+// The fx.log entries a session's log holds, oldest first.
+async function logEntries(durability, sessionId) {
+  const instance = await durability.world();
+  const page = await instance.events.list({ runId: sessionId, pagination: { sortOrder: "asc", limit: 1000 }, resolveData: "all" });
+  return page.data
+    .filter((event) => event.eventType === "step_created" && event.eventData?.stepName === "fx.log")
+    .map((event) => JSON.parse(decoder.decode(event.eventData.input)));
+}
+
+if (durabilityKind === "world" || durabilityKind === "queue") {
+  for (const [how, name] of [
+    ["lapse", "a later delivery of the message whose delivery holds a session takes the session over at once"],
+    // Vercel runs a delivery whose function's process exited again, attempt and all.
+    ["rerun", "a delivery run again after its process died takes its session over at once"],
+  ]) test(name, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-redelivered-"));
+    dirs.push(dir);
+    // A lease that outlasts the test, renewed or held to a deadline ten
+    // minutes away: only the redelivery can free the session.
+    const { durability, broker } = await queueWorldAt(dir, durabilityKind === "queue" ? { queueLeases: true, maxDurationMs: 600_000 } : { leaseMs: 60_000, maxDurationMs: 600_000 });
+    const fenced = [];
+    const first = createAgent({ durability, onEvent: (event) => { if (event.type === "session.fenced") fenced.push(event); } });
+    const second = createAgent({ durability });
+    // Both take deliveries from the World, the first one first.
+    await first.newSessionId();
+    await second.newSessionId();
+    const held = holdStep("zeta-1");
+    const before = ran.length;
+    const session = first.session();
+    const turn = session.prompt("zeta", { messageId: "turn-z" });
+    await held.holding;
+    // The queue gives up on the first worker's process, which this one no
+    // longer runs as, and delivers the prompt's message again.
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    holds.delete("zeta-1");
+    const [message] = broker.held((input) => input.messageId === "turn-z");
+    assert.ok(message, "the prompt's message is still held");
+    const lapsed = Date.now();
+    broker[how](message);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "zeta-0 zeta-1 zeta-2");
+    assert.ok(Date.now() - lapsed < 5000, `the session was taken over ${Date.now() - lapsed} ms after its message came back, not when its lease ran out`);
+    assert.deepEqual(ran.slice(before), ["turn-z:0", "turn-z:1", "turn-z:2"], "the second worker continued the turn from its held step");
+    // The first worker's held step goes on, and its next write is refused.
+    held.release();
+    for (let waited = 0; fenced.length === 0 && waited < 5000; waited += 20) await sleep(20);
+    assert.equal(fenced.length, 1, "the replaced worker stopped at its next write");
+    const lines = await readLines(session.stream(0), 32);
+    assert.equal(lines.filter((line) => line.type === "turn_end").length, 1, "the turn ended once");
+    await first.close();
+    await second.close();
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("a worker holds a session the queue shows it holds without renewing its lease", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-held-"));
+    dirs.push(dir);
+    // The same turn on two Worlds that cannot tell whether a worker lives:
+    // one whose queue shows it, and one where each worker renews a 1 s lease.
+    const leases = {};
+    for (const [kind, options] of [["held", { queueLeases: true, maxDurationMs: 600_000 }], ["renewed", { leaseMs: 1000, maxDurationMs: 600_000 }]]) {
+      const { durability } = await queueWorldAt(join(dir, kind), options);
+      const agent = createAgent({ durability });
+      const held = holdStep(`hold-${kind}-1`);
+      const session = agent.session();
+      const turn = session.prompt(`hold-${kind}`, { messageId: `turn-${kind}` });
+      await held.holding;
+      await sleep(2500);
+      held.release();
+      assert.equal((await turn.result).stopReason, "end_turn");
+      // The worker lets the session go after its viewers hear the turn ended.
+      let entries = await logEntries(durability, session.id);
+      for (let waited = 0; !entries.some((entry) => entry.k === "release") && waited < 2000; waited += 20) {
+        await sleep(20);
+        entries = await logEntries(durability, session.id);
+      }
+      leases[kind] = entries.filter((entry) => entry.k === "lease").length;
+      assert.equal(entries.filter((entry) => entry.k === "release").length, 1, `${kind}: the worker let the session go once`);
+      if (kind === "held") {
+        const [lease] = entries.filter((entry) => entry.k === "lease");
+        assert.equal(lease.expiresAt - Date.now() > 590_000 - 3000, true, "the lease runs to the deadline");
+        assert.equal(typeof lease.delivery?.messageId, "string", "the lease names the delivery holding it");
+      }
+      await agent.close();
+    }
+    assert.equal(leases.held, 1, "one claim and no renewals");
+    assert.ok(leases.renewed >= 6, `the renewed lease was written ${leases.renewed} times in 2.5 s`);
+  });
+
+  test("a worker whose release failed has its own message delivered again, which lets the session go", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-unreleased-"));
+    dirs.push(dir);
+    const { durability } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 });
+    // The World refuses the first release written, as an outage would.
+    const instance = await durability.world();
+    const events = instance.events;
+    let refused = 0;
+    instance.events = {
+      ...events,
+      list: events.list.bind(events),
+      async create(runId, event, params) {
+        const entry = event?.eventData?.stepName === "fx.log" ? JSON.parse(decoder.decode(event.eventData.input)) : null;
+        if (entry?.k === "release" && refused === 0) {
+          refused += 1;
+          throw new Error("the World is briefly unavailable");
+        }
+        return events.create(runId, event, params);
+      },
+    };
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    assert.equal((await session.prompt("kappa", { messageId: "turn-k" }).result).stopReason, "end_turn");
+    // The next prompt is another message. Had the first one gone on as a new
+    // message, the lease it could not release would stand until its deadline.
+    const started = Date.now();
+    assert.equal((await session.prompt("lambda", { messageId: "turn-l" }).result).stopReason, "end_turn");
+    assert.equal(refused, 1);
+    assert.ok(Date.now() - started < 10_000, `the next prompt ran ${Date.now() - started} ms after it was sent`);
+    await agent.close();
+  });
+}
+
+if (durabilityKind === "memory") {
+  test("a session belongs to the agent its first input or its checkpoint names, and one from before names to default", () => {
+    const input = (messageId, agent) => ({ k: "input", key: `${messageId}:prompt`, type: "prompt", messageId, ...(agent ? { agent } : {}) });
+    const ownerOf = (...entries) => foldSessionLog(entries.map((entry, index) => ({ cursor: String(index + 1), entry }))).agent;
+    assert.equal(ownerOf(), null);
+    assert.equal(ownerOf(input("m1", "support"), input("m2", "coding")), "support");
+    assert.equal(ownerOf(input("m1"), input("m2", "coding")), "default");
+    assert.equal(ownerOf({ k: "checkpoint", through: null, data: "seed", agent: "coding" }, input("m1", "support")), "coding");
+    assert.equal(ownerOf({ k: "checkpoint", through: null, data: "seed" }, input("m1", "support")), "support");
+    assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved" }), "default");
+    assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved", agent: "support" }, input("m9", "coding")), "support");
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("one route serves every agent in the process, each delivery to the agent its message names", async () => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+    await stored.start();
+    // A World that delivers only over HTTP, to the route the test posts to.
+    const sent = [];
+    const instance = {
+      ...stored,
+      registerHandler: undefined,
+      queue: async (queueName, payload) => { sent.push({ queueName, payload }); return { messageId: `msg_${sent.length}` }; },
+      createQueueHandler: (_prefix, handler) => async (request) => {
+        const { payload, meta } = await request.json();
+        try {
+          await handler(payload, meta);
+          return new Response("ok");
+        } catch (error) {
+          return Response.json({ code: error?.code, agent: error?.agent }, { status: 500 });
+        }
+      },
+    };
+    const durability = world(instance, { name: "route", queueDurable: true });
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const coding = createTaggedAgent({ durability, name: "coding", tag: "coding" });
+    // An agent on another durability of the same kind, as an app that gives
+    // one agent vercel() and another vercel({ leaseMs }) has.
+    const ops = createTaggedAgent({ durability: world(instance, { name: "route", queueDurable: true }), name: "ops", tag: "ops" });
+    let attempt = 0;
+    const post = (route, { queueName, payload }) => {
+      attempt += 1;
+      const meta = { queueName, messageId: `msg_post_${attempt}`, attempt: 1 };
+      return route(new Request("https://app.example/wake", { method: "POST", body: JSON.stringify({ payload, meta }) }));
+    };
+    const ours = support.session();
+    const theirs = coding.session();
+    const opsSession = ops.session();
+    const first = ours.prompt("alpha");
+    const second = theirs.prompt("beta");
+    const fourth = opsSession.prompt("delta");
+    await Promise.all([first.accepted, second.accepted, fourth.accepted]);
+    const shared = wakeHandler();
+    // Every message reaches the one route, whichever agent sent it.
+    for (const message of sent.splice(0)) assert.equal((await post(shared, message)).status, 200);
+    assert.equal((await textOf(first)).text, "alpha-0 alpha-1 alpha-2");
+    assert.equal((await textOf(second)).text, "beta-0 beta-1 beta-2");
+    assert.equal((await textOf(fourth)).text, "delta-0 delta-1 delta-2");
+    assert.deepEqual(openersOf(opsSession.id), ["ops"]);
+    // An agent's own route delivers to the agent a message names, too.
+    const third = ours.prompt("gamma");
+    await third.accepted;
+    const [message] = sent.splice(0);
+    assert.equal((await post(coding.wakeHandler(), message)).status, 200);
+    assert.equal((await textOf(third)).text, "gamma-0 gamma-1 gamma-2");
+    assert.deepEqual(openersOf(ours.id), ["support"]);
+    assert.deepEqual(openersOf(theirs.id), ["coding"]);
+    // A name no agent here has is refused for the queue to deliver again.
+    const ghost = { ...message, payload: { ...message.payload, input: { ...message.payload.input, agent: "ghost", messageId: "ghost-1" } } };
+    const refused = await post(shared, ghost);
+    assert.equal(refused.status, 500);
+    assert.deepEqual(await refused.json(), { code: "FX_NO_AGENT", agent: "ghost" });
+    await support.close();
+    await coding.close();
+    await ops.close();
+    assert.equal((await post(shared, message)).status, 503, "with no agent left, the route says so");
+    await stored.close();
+  });
+}
+
 let failed = 0;
 for (const [name, fn] of tests) {
   const started = performance.now();
@@ -902,6 +1440,7 @@ for (const [name, fn] of tests) {
   }
 }
 await closeAppWorlds?.();
+await closeQueueWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
 console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);

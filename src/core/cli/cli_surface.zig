@@ -34,7 +34,6 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
-const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -49,13 +48,16 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_auth = @import("../mcp/mcp_auth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
-const usage_cli_runtime = @import("usage_cli_runtime.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("../app/usage_host.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -240,6 +242,7 @@ pub const Config = struct {
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
     remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
@@ -283,7 +286,7 @@ const SessionListOptions = struct {
 
 const UsageOptions = struct {
     format: output_contracts.OutputFormat = .text,
-    scope: usage_report.Scope = .days_30,
+    period: usage.Period = .month,
 };
 
 const WorkspaceOptions = struct {
@@ -397,6 +400,9 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Parses the launch flags `fx` and `fx ask` share. How `--model`, `--fast`,
+/// `--ultrafast`, and `--effort` reach the first turn is modeled in
+/// `tests/tla/cli/LaunchSelection.tla`.
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -792,8 +798,7 @@ fn writeProviderActivationError(
     caller: ProviderActivationCaller,
     detail: []const u8,
 ) !void {
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "{s}: {s}\n",
         .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
     );
@@ -888,7 +893,7 @@ fn activateProviderSelectionFallible(
             },
             .outcome => {},
         }
-        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        const message = try alloc.print("Provider set to {s}.\n", .{bound.label()});
         defer alloc.free(message);
         if (caller == .provider_command) try writeStdout(deps, message);
         return true;
@@ -995,8 +1000,7 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try std.fmt.allocPrint(
-                alloc,
+            const detail = try alloc.print(
                 "could not load the target model catalog ({s})",
                 .{@tagName(failure.failure.category)},
             );
@@ -1108,12 +1112,13 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| {
+    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
+    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp or !mcp_host.selected()) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
         try writeStdout(deps, text);
         return .handled_success;
-    }
+    };
 
     switch (parsed_command) {
         .interactive, .resume_session => unreachable,
@@ -1492,8 +1497,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try std.fmt.allocPrint(
-                        alloc,
+                    const message = try alloc.print(
                         "could not list models: {s}",
                         .{catalogFailureDetail(failure.failure)},
                     );
@@ -1855,31 +1859,53 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-                try writeUsageCommandFailure(
-                    alloc,
-                    deps,
-                    error.HomeNotSet,
-                    opts.format,
-                );
+            // A relative $HOME counts as unset, as everywhere else in fx.
+            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
+            if (!std.Io.Dir.path.isAbsolute(home)) {
+                try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
-            };
-            var report = usage_cli_runtime.collect(
-                alloc,
-                home,
-                opts.scope,
-                @max(io_mod.milliTimestamp(), 0),
-            ) catch |err| {
+            }
+            var startup = (if (cfg.auth_mode == .host_managed)
+                deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                )) catch |err| {
                 try writeUsageCommandFailure(alloc, deps, err, opts.format);
                 return .handled_failure;
             };
-            defer report.deinit(alloc);
-            const text = try (output_contracts.UsageSnapshot{
-                .report = &report,
-            }).render(alloc, opts.format);
+            defer startup.deinit(alloc);
+
+            var dashboard = usage.Dashboard.init(alloc, usage_host.host(home));
+            defer dashboard.deinit();
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (startup.credential) |c| {
+                if (usage_host.fromCredential(c, &label_buf)) |credential| {
+                    dashboard.open(credential);
+                } else {
+                    dashboard.openUnavailable(.unsupported_provider);
+                }
+            } else {
+                dashboard.openUnavailable(.no_gateway_sign_in);
+            }
+            dashboard.waitForFetch();
+            var snapshot = try dashboard.snapshot(alloc);
+            defer snapshot.deinit();
+            const text = try (output_contracts.UsageSnapshot{ .snapshot = &snapshot, .period = opts.period }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return if (snapshot.status == .ready) .handled_success else .handled_failure;
         },
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
@@ -2085,8 +2111,7 @@ fn runPasteSetup(
         };
     }
 
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "Saved API key to {s}.\n",
         .{secret_store.backend_label},
     );
@@ -2155,7 +2180,7 @@ const MaskedKeyRawMode = struct {
         }
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2168,11 +2193,11 @@ const MaskedKeyRawMode = struct {
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
         raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.os.tag) {
+        const vmin_idx = switch (builtin.target.os.tag) {
             .linux => 6,
             else => 16,
         };
-        const vtime_idx = switch (builtin.os.tag) {
+        const vtime_idx = switch (builtin.target.os.tag) {
             .linux => 5,
             else => 17,
         };
@@ -2180,14 +2205,14 @@ const MaskedKeyRawMode = struct {
             raw.cc[vmin_idx] = 1;
             raw.cc[vtime_idx] = 0;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
@@ -2321,14 +2346,14 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 }
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDOUT_FILENO, text);
     }
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDERR_FILENO, text);
     }
     try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
@@ -2407,6 +2432,7 @@ fn runTopLevelMcp(
     cfg: Config,
     deps: RunDeps,
 ) !RunResult {
+    if (mcp_host.selected()) return runMcpVerbs(alloc, rest, cfg, deps);
     if (rest.len == 0) {
         const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
         defer alloc.free(help);
@@ -2607,6 +2633,93 @@ fn runTopLevelMcp(
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
 }
+
+/// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
+fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [512]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.interface,
+        .err = &err.interface,
+        .surface = .cli,
+        .home = home,
+        .workspace_root = workspace_root,
+        .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+    }, args);
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
+}
+
+/// A host made for one `fx mcp` command.
+const CliMcpHosts = struct {
+    alloc: Allocator,
+    cfg: Config,
+    workspace_root: []const u8,
+
+    fn get(context: *anyopaque, notify: ?mcp_verbs.Notify) anyerror!?*mcp_host.Host {
+        const self: *CliMcpHosts = @ptrCast(@alignCast(context));
+        const load = self.cfg.load_mcp_host orelse return null;
+        return load(self.alloc, self.workspace_root, self.cfg.tool_set.registry, .{ .notify = notify });
+    }
+
+    /// `fx mcp` exits after its one command, so nothing waits for the
+    /// servers; a logout already waited for its revocation.
+    fn release(_: *anyopaque, _: *mcp_host.Host) void {
+        mcp_host.signalServersForExit();
+    }
+
+    fn changed(_: *anyopaque) void {}
+};
+
+/// Streams through `deps`, so `login` shows its address while it waits.
+const DepsWriter = struct {
+    deps: RunDeps,
+    stream: enum { stdout, stderr },
+    interface: std.Io.Writer,
+
+    fn init(deps: RunDeps, stream: @FieldType(DepsWriter, "stream"), buffer: []u8) DepsWriter {
+        return .{ .deps = deps, .stream = stream, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn emit(self: *DepsWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        const written = switch (self.stream) {
+            .stdout => writeStdout(self.deps, bytes),
+            .stderr => writeStderr(self.deps, bytes),
+        };
+        written catch return error.WriteFailed;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DepsWriter = @alignCast(@fieldParentPtr("interface", w));
+        try self.emit(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.emit(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.emit(last);
+        return n + last.len * splat;
+    }
+};
 
 fn authenticateMcpCommand(
     alloc: Allocator,
@@ -2880,8 +2993,8 @@ fn usageFailureMessage(err: anyerror) []const u8 {
         error.HomeNotSet => "HOME is not set",
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
-        => "local usage storage is unsafe",
-        else => "local usage data is unavailable",
+        => "the ~/.fx folder is unsafe",
+        else => "couldn't load the fx profile",
     };
 }
 
@@ -3392,13 +3505,11 @@ fn writeSessionDetailFailure(
     format: output_contracts.OutputFormat,
 ) !void {
     const message = switch (err) {
-        error.InvalidSessionFormat => try std.fmt.allocPrint(
-            alloc,
+        error.InvalidSessionFormat => try alloc.print(
             "session {s} is corrupt; run `fx session recover {s}`",
             .{ session_id, session_id },
         ),
-        error.UnsupportedSessionSchema => try std.fmt.allocPrint(
-            alloc,
+        error.UnsupportedSessionSchema => try alloc.print(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
@@ -3628,6 +3739,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
     };
 }
 
@@ -3830,12 +3942,12 @@ fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
             if (period_seen or index + 1 >= args.len) return error.InvalidUsageArgs;
             period_seen = true;
             index += 1;
-            options.scope = if (std.mem.eql(u8, args[index], "24h"))
-                .hours_24
+            options.period = if (std.mem.eql(u8, args[index], "today"))
+                .today
             else if (std.mem.eql(u8, args[index], "7d"))
                 .days_7
-            else if (std.mem.eql(u8, args[index], "30d"))
-                .days_30
+            else if (std.mem.eql(u8, args[index], "month"))
+                .month
             else
                 return error.InvalidUsageArgs;
             continue;
@@ -3858,7 +3970,7 @@ fn parseSessionListCursor(raw: []const u8) !session_store.ResumableSessionContin
     const updated_at_ms = std.fmt.parseInt(i64, updated_text, 10) catch
         return error.InvalidLocalSurfaceArgs;
     var canonical: [320]u8 = undefined;
-    const encoded = std.fmt.bufPrint(
+    const encoded = std.mem.print(
         &canonical,
         "v1:{d}:{s}",
         .{ updated_at_ms, id },
@@ -3871,8 +3983,7 @@ fn formatSessionListCursor(
     alloc: Allocator,
     summary: session_store.SessionSummary,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "v1:{d}:{s}",
         .{ summary.updated_at_ms, summary.id },
     );
@@ -4200,9 +4311,9 @@ test "help aliases route to help" {
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-h")}));
 }
 
-test "usage arguments accept only rolling periods and one JSON flag" {
+test "usage arguments accept today, 7d or 30d and one JSON flag" {
     const defaults = try parseUsageArgs(&.{});
-    try std.testing.expectEqual(usage_report.Scope.days_30, defaults.scope);
+    try std.testing.expectEqual(usage.Period.month, defaults.period);
     try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
 
     const selected = try parseUsageArgs(&.{
@@ -4210,13 +4321,15 @@ test "usage arguments accept only rolling periods and one JSON flag" {
         @constCast("--period"),
         @constCast("7d"),
     });
-    try std.testing.expectEqual(usage_report.Scope.days_7, selected.scope);
+    try std.testing.expectEqual(usage.Period.days_7, selected.period);
+    try std.testing.expectEqual(usage.Period.today, (try parseUsageArgs(&.{ @constCast("--period"), @constCast("today") })).period);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
 
     for ([_][]const [:0]const u8{
         &.{@constCast("--period")},
         &.{ @constCast("--period"), @constCast("session") },
-        &.{ @constCast("--period"), @constCast("24h"), @constCast("--period"), @constCast("7d") },
+        &.{ @constCast("--period"), @constCast("24h") },
+        &.{ @constCast("--period"), @constCast("today"), @constCast("--period"), @constCast("7d") },
         &.{ @constCast("--json"), @constCast("--json") },
         &.{@constCast("30d")},
     }) |invalid| {
@@ -5099,8 +5212,7 @@ test "top-level MCP trust persists project approval without interactive startup"
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    const expected = try std.fmt.allocPrint(
-        alloc,
+    const expected = try alloc.print(
         "Approved project MCP server 'fixture' for {s}.\n",
         .{workspace_root},
     );

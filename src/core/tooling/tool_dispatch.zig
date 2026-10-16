@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
@@ -282,6 +283,10 @@ pub const DispatchContext = struct {
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
     lifecycle_allocator: Allocator = std.heap.c_allocator,
+    /// Thread-safe allocator whose frees return memory, for work that must not
+    /// outlive one call, such as a workspace scan. `allocator` is often the
+    /// turn's arena, which keeps everything until the turn ends.
+    scratch_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
@@ -459,12 +464,14 @@ pub const Tool = struct {
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
     /// A host tool whose calls may run beside neighboring calls of other such
-    /// tools. A host tool that declares `writes` leaves it unset and runs
-    /// alone. Concurrency never changes a call's permission review.
+    /// tools. A host tool that declares `writes`, or that is not idempotent
+    /// and does not declare `writes: false`, leaves it unset and runs alone.
+    /// Concurrency never changes a call's permission review.
     host_concurrent: bool = false,
     /// A host tool the host declares idempotent: running a call again has
-    /// the effect of running it once, so a journaled session need not store
-    /// its intent before it runs.
+    /// the effect of running it once. A journaled session starts a call of
+    /// such a tool that is also concurrent without waiting for its intent to
+    /// be stored.
     host_idempotent: bool = false,
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
@@ -549,7 +556,7 @@ pub fn dispatchRunCommandCompatibility(
         registry,
         request.command,
     )) orelse return null;
-    if (std.mem.indexOfAny(u8, request.command, "|;&\n") != null) return null;
+    if (std.mem.findAny(u8, request.command, "|;&\n") != null) return null;
     return try matched.compatibility.execute(ctx, request.command);
 }
 
@@ -855,7 +862,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
+        .not_registered => return failure(try call_ctx.allocator.print("unknown tool: {s}", .{call.name})),
         .failure => |reason| return failure(reason),
         .admitted => |admitted| {
             defer admitted.deinit();
@@ -893,7 +900,7 @@ pub fn dispatchAuthorizedToolCall(
 ) DispatchError!AuthorizedDispatchResult {
     const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .not_registered => return .{ .status = .failure, .body = try ctx.allocator.print("unknown tool: {s}", .{call.name}) },
         .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
             defer input.value.deinit(ctx.allocator);
@@ -1371,7 +1378,7 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
 
 test "admitToolCall cleans decoded input across ask failure-body allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAdmitToolCallAskFailureAllocationFailures,
         .{},
     );
@@ -1417,7 +1424,7 @@ test "dispatchToolCall traces denied web_search query without secrets or executi
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

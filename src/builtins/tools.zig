@@ -40,7 +40,7 @@ const glob_files_description =
 const grep_files_description =
     "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
 const read_file_description =
-    "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
+    "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, bypass dedicated search tools, or reopen a stored tool result, which read_tool_result reads by its handle.";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
@@ -50,7 +50,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.";
+    "Send every command as one request object: {\"request\":{\"action\":\"run\",\"command\":\"...\"}}. The action is always request.action (run, interact or stop), never the tool name; request is never a JSON string, and no action field sits beside it. Every number is a JSON integer, not text: yield_time_ms is 0-30000 for run, 0-300000 for interact; timeout_ms is at least 1, omitted for work meant to keep running. A command still running after yield_time_ms returns one owned session_id; interact with that exact id to observe or send input, and stop only to terminate. Write multi-line input to a script file and run it: literal newlines cannot be encoded inside request. Each call starts a new shell with the user's startup files, so cd, export and alias changes do not carry over. Never detach with &, nohup, setsid or double-forking. output_delta is always terminal-safe and full_output_handle keeps exact output. In zsh, quote globs meant for another program (like '--include=*.zig') and words starting with =.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -76,14 +76,14 @@ const shell_run_properties = [_]model_tool_schema.Property{
 
 const shell_interact_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"interact"} } },
-    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
+    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle that a run returned when it was still going after yield_time_ms." },
     .{ .name = "chars", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "Exact characters to send to tty=true work before observing it. Omit or send an empty string to only observe. Observe application readiness before sending control characters. Use \\n for Enter and JSON escapes such as \\u0003 for control characters." },
     .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Wait before yielding output. Empty observations wait 5000-300000 ms; shorter values are raised to 5000. Non-empty input is capped at 30000 ms and keeps shorter requested waits. Defaults to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
 };
 
 const shell_stop_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} } },
-    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
+    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle that a run returned when it was still going after yield_time_ms." },
     .{ .name = "force", .json_type = .boolean, .description = "Use immediate force termination when true. Defaults to false." },
 };
 
@@ -219,7 +219,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Send one request object: {\"request\":{\"handle\":\"...\"}} with the handle, or request.query to find a known literal line, or the optional request byte range (request.start_byte, request.byte_count); never serialize request to a string or place its fields beside it. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -920,6 +920,14 @@ pub fn toolHasPermissionContract(tool_name: []const u8) bool {
     return lookup(tool_name) != null;
 }
 
+test "built-in tool descriptions stay inside the advertised cap" {
+    // The gateway schema truncates a longer description, which would silently
+    // drop the contract the model needs most.
+    inline for (all) |tool| {
+        try std.testing.expect(tool.description.len <= model_tool_schema.description_max_bytes);
+    }
+}
+
 test "built-in model-facing tool contract stays byte exact" {
     const alloc = std.testing.allocator;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -948,7 +956,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "ca8b5aa265c6318fbd0604879fb2626826d9fcb83fa5d335dc0371fec7286b3f",
+        "889f6835516792166ab992efff03223701360e27d99ad0ab642390d47ecdaccb",
         &actual_hex,
     );
 }
@@ -956,14 +964,14 @@ test "built-in model-facing tool contract stays byte exact" {
 test "registry classifies every built-in progress label" {
     inline for (all) |tool| {
         var started_buf: [96]u8 = undefined;
-        const started = try std.fmt.bufPrint(&started_buf, "{s} value", .{tool.action_label});
+        const started = try std.mem.print(&started_buf, "{s} value", .{tool.action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.started,
             tool_dispatch.classifyProgressLabel(registry, started),
         );
 
         var completed_buf: [96]u8 = undefined;
-        const completed = try std.fmt.bufPrint(&completed_buf, "{s} value", .{tool.completed_action_label});
+        const completed = try std.mem.print(&completed_buf, "{s} value", .{tool.completed_action_label});
         try std.testing.expectEqual(
             tool_dispatch.ProgressLabelKind.completed,
             tool_dispatch.classifyProgressLabel(registry, completed),
@@ -1031,7 +1039,7 @@ test "shell advertises only run interact and stop" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, shell);
     defer alloc.free(schema_json);
     for ([_][]const u8{ "run", "interact", "stop" }) |action| {
-        const needle = try std.fmt.allocPrint(alloc, "\"{s}\"", .{action});
+        const needle = try alloc.print("\"{s}\"", .{action});
         defer alloc.free(needle);
         try std.testing.expect(std.mem.find(u8, schema_json, needle) != null);
     }
@@ -1678,7 +1686,8 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass request.query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Send one request object") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "never serialize request to a string") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "inspect results from another session or process") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
     const input_schema = parsed.value.object.get("inputSchema").?.object;

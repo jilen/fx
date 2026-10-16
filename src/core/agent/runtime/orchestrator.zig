@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
@@ -57,6 +58,7 @@ const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const request_image_budget = @import("request_image_budget.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
@@ -593,7 +595,7 @@ test "legacy exec argument projection releases temporary allocations" {
             try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn findLegacyCall(
@@ -616,14 +618,12 @@ fn legacyToolSummary(
     const body = content orelse "";
     const bounded = text_utils.utf8PrefixByBytes(body, 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed.]",
             .{action},
         )
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior terminal {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -957,10 +957,9 @@ fn subagent_history_summary(
 ) Allocator.Error![]u8 {
     const bounded = text_utils.utf8PrefixByBytes(content orelse "", 4096);
     return if (bounded.len == 0)
-        std.fmt.allocPrint(alloc, "[Prior subagent {s} action completed.]", .{action})
+        alloc.print("[Prior subagent {s} action completed.]", .{action})
     else
-        std.fmt.allocPrint(
-            alloc,
+        alloc.print(
             "[Prior subagent {s} action completed. Stored result follows.]\n{s}",
             .{ action, bounded },
         );
@@ -1289,7 +1288,7 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
 
 test "subagent history projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_subagent_history_projection_allocation_failures,
         .{},
     );
@@ -1328,6 +1327,14 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+/// Terminal tool arguments arrive in shapes the advertised schema does not
+/// allow: the request serialized to a string, action fields beside request, a
+/// missing action, and integers sent as text. Every repair below only moves or
+/// retypes a field the model already stated, and the repaired object goes to
+/// permission admission and shell decode alike, so the two never disagree about
+/// what runs. A repair that would overwrite a value the request already states
+/// is not attempted.
+/// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency)
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1337,24 +1344,86 @@ fn normalized_terminal_request_arguments(
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.getPtr("request") orelse return null;
-    if (request.* == .string) {
-        request.* = std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), request.string, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
-        };
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+
+    var object: std.json.ObjectMap = blk: {
+        if (parsed.value.object.count() == 1) {
+            const wrapper = parsed.value.object.getPtr("request") orelse break :blk parsed.value.object;
+            const value = try decodeTerminalRequestValue(arena, wrapper.*) orelse return null;
+            if (value != .object) return null;
+            break :blk value.object;
+        }
+        const wrapper = parsed.value.object.get("request") orelse break :blk parsed.value.object;
+        const value = try decodeTerminalRequestValue(arena, wrapper) orelse return null;
+        if (value != .object) return null;
+        break :blk try mergeOuterTerminalFields(arena, value.object, parsed.value.object) orelse return null;
+    };
+
+    // A flat call that states a command and nothing that names another action
+    // means run; the action field is the only thing added.
+    if (object.get("action") == null) {
+        if (!statesRunAction(object)) return null;
+        try object.put(arena, "action", .{ .string = "run" });
     }
-    if (request.* != .object) return null;
-    _ = try normalize_terminal_model_input(
-        parsed.arena.allocator(),
-        &request.object,
-    );
+    coerceTerminalIntegerText(&object);
+    _ = try normalize_terminal_model_input(arena, &object);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+/// Reads a `request` value the model may have serialized to a string.
+fn decodeTerminalRequestValue(arena: Allocator, value: std.json.Value) Allocator.Error!?std.json.Value {
+    if (value != .string) return value;
+    const object = tool_args.parseEncodedJsonObject(arena, value.string) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return .{ .object = object };
+}
+
+/// Adopts the fields a model placed beside `request` into the request itself,
+/// keeping every value the request already states. A field the request already
+/// states is a collision, and the call is left for shell decode to report.
+fn mergeOuterTerminalFields(
+    arena: Allocator,
+    request: std.json.ObjectMap,
+    outer: std.json.ObjectMap,
+) Allocator.Error!?std.json.ObjectMap {
+    var merged = request;
+    var fields = outer.iterator();
+    while (fields.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "request")) continue;
+        if (merged.contains(entry.key_ptr.*)) return null;
+        try merged.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return merged;
+}
+
+/// Reports whether a flat argument object states a command and nothing that
+/// belongs to another action.
+fn statesRunAction(object: std.json.ObjectMap) bool {
+    const command = object.get("command") orelse return false;
+    if (command != .string or command.string.len == 0) return false;
+    for ([_][]const u8{ "session_id", "chars", "force" }) |name| {
+        if (object.contains(name)) return false;
+    }
+    return true;
+}
+
+/// Reads the integer fields a model sent as text. A value that does not parse
+/// is left alone, so shell decode still reports the type problem.
+fn coerceTerminalIntegerText(object: *std.json.ObjectMap) void {
+    for ([_][]const u8{ "timeout_ms", "yield_time_ms" }) |name| {
+        const value = object.getPtr(name) orelse continue;
+        if (value.* != .string) continue;
+        const number = std.fmt.parseInt(u64, std.mem.trim(u8, value.string, " \t\r\n"), 10) catch continue;
+        if (number > std.math.maxInt(u32)) continue;
+        value.* = .{ .integer = @intCast(number) };
+    }
 }
 
 fn managed_subagent_action(action: []const u8) ?[]const u8 {
@@ -2084,7 +2153,7 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
 }
 
 test "legacy request projection preserves replay ownership and source binding on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_legacy_replay_projection_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_legacy_replay_projection_allocations, .{});
 }
 
 test "mixed legacy terminal batches become inert in every order" {
@@ -2267,7 +2336,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
 
 test "terminal request projection cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_projection_allocation_failures,
         .{},
     );
@@ -2282,10 +2351,15 @@ test "terminal request normalization accepts object JSON strings" {
         "{\"request\":\"invalid\"}",
         "{\"request\":\"[]\"}",
         "{\"request\":\"{\\\"command\\\":\\\"pwd\\\",\\\"command\\\":\\\"true\\\"}\"}",
-        "{\"request\":\"{}\",\"command\":\"pwd\"}",
     }) |args| {
         try std.testing.expectEqual(@as(?[]u8, null), try normalized_terminal_request_arguments(alloc, args));
     }
+
+    // An empty request beside a stated command adopts the command and reads as
+    // a run, because nothing the model stated is overwritten.
+    const adopted = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{}\",\"command\":\"pwd\"}")).?;
+    defer alloc.free(adopted);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\",\"action\":\"run\"}", adopted);
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
@@ -2411,7 +2485,7 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     const non_exact_calls = [_]ToolCall{.{
         .id = "non-exact",
         .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"},\"extra\":true}",
+        .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"},\"command\":\"false\"}",
     }};
     const non_exact = try normalize_terminal_request_tool_calls(arena, native_registry, true, &non_exact_calls);
     try std.testing.expectEqual(non_exact_calls[0..].ptr, non_exact.ptr);
@@ -2424,6 +2498,63 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     }};
     const malformed = try normalize_terminal_request_tool_calls(arena, native_registry, true, &malformed_calls);
     try std.testing.expectEqual(malformed_calls[0..].ptr, malformed.ptr);
+}
+
+test "terminal request normalization repairs the shapes models actually send" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const terminal = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{terminal} };
+
+    const Shape = struct { args: []const u8, expected: ?[]const u8 };
+    const shapes = [_]Shape{
+        // The advertised shape is unwrapped exactly, as before.
+        .{ .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}", .expected = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        // The request serialized to a string, with a multi-line command the
+        // model left as a literal newline.
+        .{
+            .args = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"git commit -F - <<'EOF'\\nfix: x\\nEOF\\\"}\"}",
+            .expected = "{\"action\":\"run\",\"command\":\"git commit -F - <<'EOF'\\nfix: x\\nEOF\"}",
+        },
+        // Action fields beside request are adopted into it.
+        .{
+            .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"},\"timeout_ms\":60000}",
+            .expected = "{\"action\":\"run\",\"command\":\"pwd\",\"timeout_ms\":60000}",
+        }, // Integers sent as text are read as integers.
+        .{
+            .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\",\"timeout_ms\":\"60000\"}}",
+            .expected = "{\"action\":\"run\",\"command\":\"pwd\",\"timeout_ms\":60000}",
+        },
+        // A flat command with no action means run.
+        .{ .args = "{\"command\":\"pwd\"}", .expected = "{\"command\":\"pwd\",\"action\":\"run\"}" },
+        // A field the request already states is a collision, not a repair.
+        .{ .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"},\"command\":\"false\"}", .expected = null },
+        // A session action never gains an inferred action.
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"x\"}", .expected = null },
+        // Text that is not JSON is left for shell decode to report.
+        .{ .args = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\",\\\"command\\\":\\\"pwd\\\"}\"}", .expected = null },
+    };
+
+    for (shapes) |shape| {
+        const calls = [_]ToolCall{.{ .id = "call", .name = "terminal", .arguments_json = shape.args }};
+        const normalized = try normalize_terminal_request_tool_calls(arena, registry, true, &calls);
+        if (shape.expected) |expected| {
+            try std.testing.expect(normalized.ptr != calls[0..].ptr);
+            try std.testing.expectEqualStrings(expected, normalized[0].arguments_json);
+        } else {
+            try std.testing.expectEqual(calls[0..].ptr, normalized.ptr);
+        }
+    }
 }
 
 fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !void {
@@ -2470,7 +2601,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
 
 test "terminal request normalization cleans every partial allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         check_terminal_request_normalization_allocation_failures,
         .{},
     );
@@ -2587,7 +2718,7 @@ fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolC
     const prepare = deps.prepare_skill_call orelse return null;
     return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
         error.OutOfMemory, error.Cancelled => return err,
-        else => .{ .failure = .{ .model_output = try std.fmt.allocPrint(arena, "skill failed: {s}", .{@errorName(err)}) } },
+        else => .{ .failure = .{ .model_output = try arena.print("skill failed: {s}", .{@errorName(err)}) } },
     };
 }
 
@@ -2724,8 +2855,7 @@ fn preparedTerminalModelOutput(
 ) Allocator.Error![]const u8 {
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
-        .unsupported => try std.fmt.allocPrint(
-            alloc,
+        .unsupported => try alloc.print(
             "Unsupported tool: {s}",
             .{call.name},
         ),
@@ -3959,6 +4089,32 @@ fn appendRunningToolCalls(
     });
 }
 
+/// Streams one main-model completion, then has the host confirm it still
+/// owns the session, so no tool call runs in a session another process
+/// took over. A lost writer fails like the stream itself, through the same
+/// recovery path; other check failures are only traced.
+fn streamMainCompletion(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    request: agent_stream_provider.ModelRequest,
+) !runtime_gateway_step.StreamResult {
+    var result = try runtime_gateway_step.streamModelCompletion(deps.agent_stream_provider, arena, request);
+    if (result != .completed) return result;
+    const confirm = deps.confirm_session_writer orelse return result;
+    confirm(deps.ctx) catch |err| switch (err) {
+        error.SessionPersistenceUncertain,
+        error.SessionWriterChanged,
+        error.SessionWriterParked,
+        error.SessionCommitFailed,
+        => {
+            result.deinit(arena);
+            return err;
+        },
+        else => debug_trace.logf("agent", "session writer check failed err={s}", .{@errorName(err)}),
+    };
+    return result;
+}
+
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -4123,12 +4279,12 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     const alloc = turn.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     for (0..1000) |step_index| {
-        const id = try std.fmt.allocPrint(alloc, "read_{d}", .{step_index});
+        const id = try alloc.print("read_{d}", .{step_index});
         const calls = try alloc.alloc(ToolCall, 1);
         calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
         try messages.appendSlice(alloc, &.{
             .{ .role = .assistant, .tool_calls = calls },
-            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = "current evidence" ** 16 },
+            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
         });
         const retained_bytes = turn.queryCapacity();
         try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 10, 1, false, .transport_interrupted, .retry_request, .confirmed, .{});
@@ -4421,7 +4577,7 @@ test "discarded completion prose preserves ownership and fails atomically" {
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
@@ -4530,6 +4686,95 @@ test "context overflow recovery is typed safe and bounded" {
         case.recovery_available,
         case.cancelled,
     ));
+}
+
+/// Size retries allowed in one turn. Each lowers the learned limit, so the
+/// next request leaves out more of its oldest images.
+const max_request_size_retries: u8 = 2;
+
+/// A size rejection is retried without compaction only when the rejected
+/// request carried images the next one can leave out. Anything else falls
+/// through to context overflow recovery.
+fn shouldRetryWithFewerImages(
+    failure: agent_stream_provider.Failure,
+    images_sent: usize,
+    retries_used: u8,
+    replay_safe: bool,
+    cancelled: bool,
+) bool {
+    return !cancelled and
+        replay_safe and
+        images_sent > 0 and
+        retries_used < max_request_size_retries and
+        failure.kind == .request_too_large;
+}
+
+/// The size the next request must fit after `rejected_bytes` were refused.
+fn loweredRequestByteLimit(rejected_bytes: usize) usize {
+    return rejected_bytes / 4 * 3;
+}
+
+/// Leaves the oldest images out of `request` until its serialized body fits
+/// `limits`, rebuilding after each change, and returns the body to send.
+/// Every pass leaves out at least one more image, so the loop ends.
+fn fitRequestImages(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    first_body: []const u8,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    var body = first_body;
+    while (true) {
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        if (projection.withheld == 0) return body;
+        var smaller = request.*;
+        smaller.messages = projection.messages;
+        const rebuilt = (try provider.buildRequest(arena, smaller)) orelse return body;
+        debug_trace.eventf("images", "request_images_withheld", trace_ctx, "withheld={d} request_bytes_before={d} request_bytes_after={d} limit_bytes={d}", .{
+            projection.withheld,
+            body.len,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        request.* = smaller;
+        body = rebuilt;
+    }
+}
+
+test "size rejections retry with fewer images only while images remain" {
+    const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
+    const overflow_text = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: input is too long"),
+    };
+    const cases = [_]struct {
+        failure: agent_stream_provider.Failure,
+        images_sent: usize = 3,
+        retries_used: u8 = 0,
+        replay_safe: bool = true,
+        cancelled: bool = false,
+        expected: bool,
+    }{
+        .{ .failure = too_large, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries - 1, .expected = true },
+        .{ .failure = too_large, .retries_used = max_request_size_retries, .expected = false },
+        .{ .failure = too_large, .images_sent = 0, .expected = false },
+        .{ .failure = too_large, .replay_safe = false, .expected = false },
+        .{ .failure = too_large, .cancelled = true, .expected = false },
+        .{ .failure = overflow_text, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
+        case.failure,
+        case.images_sent,
+        case.retries_used,
+        case.replay_safe,
+        case.cancelled,
+    ));
+    try std.testing.expectEqual(@as(usize, 30_000), loweredRequestByteLimit(40_000));
+    try std.testing.expect(loweredRequestByteLimit(33_829_735) < 33_829_735);
 }
 
 /// fx never asks a model to extend an assistant message, and models without
@@ -4778,7 +5023,7 @@ test "deferred retry cleanup clears status and contains sink errors" {
     clear_deferred_retry_status(&deps);
     try std.testing.expectEqual(@as(usize, 1), normal.route_recovery_clear_count);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var failed = support.FakeAgentRuntimeDeps.init(failing.allocator());
     defer failed.deinit();
     const failed_deps = failed.deps();
@@ -4942,20 +5187,6 @@ fn refreshGatewayCredentialForJob(
         );
         return false;
     } orelse return false;
-    const previous_api_key = active_api_key.*;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
-        }
-    }
     if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
     owned_api_key.* = refreshed;
     active_api_key.* = refreshed;
@@ -5244,7 +5475,7 @@ fn prepareExternalFailureDiagnostic(
 ) !types.ModelFailureDiagnostic {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const owned_source = if (trimmed.len > 0 and !hasDiagnosticIdentifier(trimmed))
-        try std.fmt.allocPrint(alloc, "{s}: {s}", .{ fallback, trimmed })
+        try alloc.print("{s}: {s}", .{ fallback, trimmed })
     else
         null;
     defer if (owned_source) |source| alloc.free(source);
@@ -5263,9 +5494,9 @@ fn prepareExternalFailureDiagnostic(
 }
 
 fn hasDiagnosticIdentifier(text: []const u8) bool {
-    if (std.mem.indexOf(u8, text, ": ")) |separator| {
+    if (std.mem.find(u8, text, ": ")) |separator| {
         if (separator == 0) return false;
-        return std.mem.indexOfAny(u8, text[0..separator], " \t\r\n") == null;
+        return std.mem.findAny(u8, text[0..separator], " \t\r\n") == null;
     }
     for (text) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;
@@ -6243,7 +6474,7 @@ pub fn compactContext(
         .before_summary = request.before_summary,
     };
     if (progress.operation_id) |id| deps.compaction_activity.?.running(deps.ctx, id, .preparation);
-    errdefer |err| {
+    return compactWithProgress(alloc, deps, request, &progress) catch |err| {
         if (err == error.Cancelled) {
             compactor.traceEvent(trace_ctx, .transaction_failed, "stage={s} origin={s} err={s}", .{ @tagName(progress.stage), @tagName(request.activity_origin), @errorName(err) });
         } else {
@@ -6253,7 +6484,18 @@ pub fn compactContext(
             deps.compaction_activity.?.settle(deps.ctx, id, compaction_activity.failure(err, progress.stage, cancel_flag.load(.seq_cst)));
             if (request.failure_provenance) |out| out.* = .{ .operation_id = id, .turn_id = trace_ctx.turn_id, .err = err };
         }
-    }
+        return err;
+    };
+}
+
+fn compactWithProgress(
+    alloc: Allocator,
+    deps: *const AgentRuntimeDeps,
+    request: ContextCompactionRequest,
+    progress: *CompactionProgress,
+) !?compactor.Result {
+    const trace_ctx = request.compactor.trace_ctx;
+    const cancel_flag = request.compactor.cancel_flag;
     var compactor_request = request.compactor;
     compactor_request.progress = progress.interface();
     var result = try compactor.compact(alloc, compactor_request) orelse {
@@ -6350,7 +6592,7 @@ test "compaction activity automatic error provenance excludes secondary finaliza
             var job = fixture.job();
             job.turn_id = 31;
             job.model = @constCast(model);
-            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
             var history = [_]HistoryTurn{.{ .assistant = .{
                 .user = .{ .text = @constCast("earlier request") },
                 .assistant = @constCast("earlier answer"),
@@ -6468,7 +6710,7 @@ test "automatic compaction interruption persists transport cancellation and pres
         var job = fixture.job();
         job.turn_id = 37;
         job.model = @constCast(model);
-        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
+        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("earlier request") },
             .assistant = @constCast("earlier answer"),
@@ -6619,7 +6861,7 @@ test "compaction activity transaction settles only after publication and preserv
         // A tool call leaves work to summarize, so the model is asked. Its
         // output is larger than the kept budget, so the turn is compacted,
         // while its user message still fits word for word.
-        const notes = "recorded notes " ** 400;
+        const notes = text_utils.repeat("recorded notes ", 400);
         const calls = [_]types.ToolCall{.{ .id = "record-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
         const results = [_]types.PersistedToolResult{.{
             .tool_call_id = @constCast("record-1"),
@@ -6631,7 +6873,7 @@ test "compaction activity transaction settles only after publication and preserv
         }};
         const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
         const turns = [_]HistoryTurn{.{ .assistant = .{
-            .user = .{ .text = @constCast("recorded source " ** 100) },
+            .user = .{ .text = @constCast(text_utils.repeat("recorded source ", 100)) },
             .assistant = @constCast("Recorded it."),
             .execution = .{ .tool_steps = @constCast(&steps) },
         } }};
@@ -7029,6 +7271,7 @@ fn processQueuedPromptLoop(
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
+        var request_size_retries: u8 = 0;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -7290,7 +7533,7 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
-            const request_data = agent_stream_provider.RequestData{
+            var request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
@@ -7308,11 +7551,22 @@ fn processQueuedPromptLoop(
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
+            var request_images_for_attempt: usize = 0;
             if (try deps.agent_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
-            )) |request_body| {
+            )) |built_request_body| {
+                const request_body = try fitRequestImages(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    built_request_body,
+                    .{ .max_request_bytes = agent.requestByteLimit(gateway_model) orelse request_image_budget.default_max_request_bytes },
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
                 prepared_request_body = request_body;
+                request_images_for_attempt = image_data.countRequestImages(request_data.messages);
                 const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
                 const applicable_calibration = if (agent.request_token_calibration) |*calibration|
                     if (std.mem.eql(u8, calibration.modelSlice(), gateway_model) and calibration.cost.applies(measured_request_cost))
@@ -7409,8 +7663,6 @@ fn processQueuedPromptLoop(
                         .max_output_tokens = request_data.max_output_tokens,
                         .capabilities_context = deps.ctx,
                         .capabilities_fn = deps.available_model_capabilities,
-                        .usage = deps.usage,
-                        .usage_allocator = deps.usage_allocator,
                         // The request just built starts like the one sent
                         // before it, so the provider has most of it cached.
                         // After an overflow it no longer fits.
@@ -7586,13 +7838,7 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
-            stream_result = runtime_gateway_step.streamModelCompletion(
-                deps.agent_stream_provider,
-                arena,
-                model_request,
-                deps.usage,
-                deps.usage_allocator,
-            ) catch |err| {
+            stream_result = streamMainCompletion(deps, arena, model_request) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
                     overlay_arena,
@@ -8014,13 +8260,7 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
-                    stream_result = try runtime_gateway_step.streamModelCompletion(
-                        deps.agent_stream_provider,
-                        arena,
-                        model_request,
-                        deps.usage,
-                        deps.usage_allocator,
-                    );
+                    stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
@@ -8123,6 +8363,32 @@ fn processQueuedPromptLoop(
             else
                 compacted_suffix_len < within_turn_suffix.items.len;
             if (response_failure) |failure| {
+                // A size rejection with images aboard retries with a lower
+                // limit, which leaves out the oldest images instead of
+                // compacting the conversation.
+                if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
+                    failure,
+                    request_images_for_attempt,
+                    request_size_retries,
+                    streamReplaySafe(&stream_ctx),
+                    config.cancel_flag.load(.seq_cst),
+                )) {
+                    const limit = loweredRequestByteLimit(rejected.serialized_bytes);
+                    agent.lowerRequestByteLimit(gateway_model, limit);
+                    request_size_retries += 1;
+                    debug_trace.eventf("images", "request_size_retry", step_ctx, "model={s} rejected_bytes={d} images_sent={d} limit_bytes={d} retry={d}", .{
+                        gateway_model,
+                        rejected.serialized_bytes,
+                        request_images_for_attempt,
+                        limit,
+                        request_size_retries,
+                    });
+                    _ = summary_accumulator.finishTokenRequestWithoutUsage(false);
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    reset_stream_for_next_attempt = true;
+                    continue;
+                };
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,

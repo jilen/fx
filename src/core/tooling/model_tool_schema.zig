@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const description_max_bytes: usize = 1024;
 pub const truncation_marker = "... [truncated]";
@@ -163,7 +164,9 @@ pub fn writeObjectSchema(
         {
             return error.InvalidObjectSchema;
         }
-        try writer.writeAll("{\"oneOf\":[");
+        // The union is still one object: naming the type keeps a model from
+        // reading an untyped oneOf as permission to send a string.
+        try writer.writeAll("{\"type\":\"object\",\"oneOf\":[");
         for (schema.one_of, 0..) |alternative, index| {
             if (index > 0) try writer.writeByte(',');
             try writeObjectSchema(alloc, writer, alternative);
@@ -320,10 +323,15 @@ test "object alternatives serialize as exclusive object branches" {
     defer parsed.deinit();
 
     const input_schema = parsed.value.object.get("inputSchema").?.object;
-    try std.testing.expect(input_schema.get("type") == null);
+    // A oneOf input schema is still one object, so the type is named and no
+    // ordinary object keys appear beside the union.
+    try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
     try std.testing.expect(input_schema.get("properties") == null);
     const one_of = input_schema.get("oneOf").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), one_of.len);
+    for (one_of) |alternative| {
+        try std.testing.expectEqualStrings("object", alternative.object.get("type").?.string);
+    }
     try std.testing.expectEqualStrings(
         "read",
         one_of[0].object.get("properties").?.object.get("action").?.object.get("enum").?.array.items[0].string,
@@ -356,7 +364,7 @@ test "object alternatives reject contradictory ordinary object metadata" {
 
 test "cappedDescriptionAlloc appends explicit truncation marker" {
     const alloc = std.testing.allocator;
-    const oversized = "x" ** (description_max_bytes + 20);
+    const oversized = text_utils.repeat("x", description_max_bytes + 20);
 
     const capped = try cappedDescriptionAlloc(alloc, oversized);
     defer alloc.free(capped);
@@ -482,7 +490,7 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
 
 test "dynamicFunctionSchemaJsonAlloc wraps rendered input schema in the flattened envelope" {
     const alloc = std.testing.allocator;
-    const description = ("d" ** (description_max_bytes + 1)) ++ "tail";
+    const description = text_utils.repeat("d", description_max_bytes + 1) ++ "tail";
     const json = try dynamicFunctionSchemaJsonAlloc(alloc, "mcp_fs_read", description, "{\"type\":\"object\",\"properties\":{}}");
     defer alloc.free(json);
 

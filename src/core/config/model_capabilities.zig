@@ -18,7 +18,10 @@ pub const ResolvedProviderOptions = struct {
 };
 
 pub const ReasoningEffortOptions = struct {
-    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = undefined,
+    /// A default-constructed option set reports no options, so the backing
+    /// array is never read. It is still defined: a `Capabilities` value is
+    /// compared whole in tests, and undefined bytes are not comparable.
+    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = @splat(.auto),
     len: usize = 0,
 
     pub fn fromSlice(source: []const types.ReasoningEffort) ReasoningEffortOptions {

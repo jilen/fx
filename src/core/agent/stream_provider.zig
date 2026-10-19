@@ -1,4 +1,5 @@
 const std = @import("std");
+const observation = @import("runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -217,6 +218,9 @@ pub fn validate_prompt_lanes(
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
+    observer: ?*observation.Observer = null,
+    parent_call_id: ?[]const u8 = null,
+    purpose: observation.ModelPurpose = .agent,
     credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
@@ -461,6 +465,9 @@ pub const Provider = struct {
     build_request_fn: ?BuildRequestFn = null,
     /// Pure provider-owned slicing when one reply becomes separate history units.
     project_replay_fn: ?*const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay = null,
+    /// The largest request body this provider's transport can carry, when it
+    /// has its own limit below any provider's.
+    max_request_bytes: ?usize = null,
 
     /// Borrows unchanged payloads; projected payloads live in the caller's arena.
     pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {

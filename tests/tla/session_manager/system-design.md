@@ -1136,10 +1136,12 @@ D59 replaces D55's import at start with conversion on open):
   handles mapped as D47 maps them; ACP client prompts and tool identities
   as D46's settings; hosted terminal state into `~/.fx/terminal/{id}`
   (D45); `-c`'s remembered app session as v2's last-opened when v2 has
-  none; unsettled usage markers; and a `recovery.json` open turn as an
-  interrupted turn with its saved pieces (D1), exactly when v1 would show
-  it: v1 drops a checkpoint whose turn is not open in its log. **Why:** each is state a
-  v1 session holds outside `session.json` and its event log.
+  none; and a `recovery.json` open turn as an interrupted turn with its
+  saved pieces (D1), exactly when v1 would show it: v1 drops a checkpoint
+  whose turn is not open in its log. It carried unsettled usage markers
+  too until fx dropped its usage ledger; it now carries no usage, and
+  leaves v1's usage files in place, ignored, as fx does. **Why:** each is
+  state a v1 session holds outside `session.json` and its event log.
   **Alternative:** convert the conversation only.
 - **D57 Decision:** v1 is removed in one step after the converter ships:
   the writer, store, listing, catalog, migration, recovery and every host
@@ -1158,9 +1160,8 @@ Settled for `/fork` (2026-10-02):
   end of the previous turn under a new id and hard-links the blobs (D5),
   so the source is never written. The app switches to the fork as a
   resume does, opening it before it closes the source (D41), writes
-  `original session fx --resume` and the source's id in the transcript,
-  and puts the
-  prompt back in the input box. The fork's title is the source's with
+  `original session fx --sessions-v2 --resume` and the source's id in the
+  transcript, and puts the prompt back in the input box. The fork's title is the source's with
   ` (fork)` once. `/fork` waits for a running turn to end, and without
   v2 it says it needs `--sessions-v2`. Subagent children and hosted
   terminals stay with the source, since the fold counts children only
@@ -1257,9 +1258,9 @@ Settled for the converter (2026-10-06):
   is left out, named in the trace and the convert output, and the rest of
   the family converts. The v2 listing must stay fast at the size
   conversion creates (about 14,000 sessions took 1.9 s a page): fixed in
-  this change, gated by the manager's benchmark. The usage marker move
-  (publish, the v2 marker, then the v1 marker's removal, then the folder)
-  is modeled in `V1Conversion.tla`. **Why:** the real run showed each
+  this change, gated by the manager's benchmark. A usage marker move came
+  with this decision and went with fx's usage ledger. **Why:** the real
+  run showed each
   limit. **Alternative:** keep whole families in memory, refuse the
   family, or fix the listing later.
 

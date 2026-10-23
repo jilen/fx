@@ -665,7 +665,9 @@ const Tool = struct {
 /// The reducer does not decide which tool names are callable. A well-formed
 /// name it did not advertise is model output the runtime answers with a tool
 /// result the model can correct, so only a name that cannot be handed back
-/// safely closes the stream.
+/// safely closes the stream. The terminal finish reason is a gateway label and
+/// the streamed calls are the ground truth, so a label that disagrees with them
+/// closes nothing either.
 pub const Reducer = struct {
     alloc: Allocator,
     limits: Limits,
@@ -951,6 +953,8 @@ pub const Reducer = struct {
 
     /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
     /// explicit errors, never executable partial calls or successful tool turns.
+    /// A terminal reason that disagrees with the calls the model streamed is
+    /// reconciled to what arrived instead of closing the stream.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
         errdefer self.phase = .closed;
@@ -965,7 +969,14 @@ pub const Reducer = struct {
             else => return error.InvalidFinishReason,
         }
         if (self.refusal_seen) return error.Refused;
-        if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
+        // The terminal finish reason is a gateway label; the calls the model
+        // streamed are the ground truth. A gateway that labels a reply "stop"
+        // after the model streamed a call, or "tool_calls" after it streamed
+        // none, mislabels the turn rather than corrupting it: fx keeps what
+        // arrived and reports the reason that matches. A reply with calls is a
+        // tool turn and a reply without them is a prose answer, so a call the
+        // model actually sent is never silently dropped.
+        const terminal_reason: types.ProviderFinishReason = if (self.tools.items.len != 0) .tool_calls else .stop;
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
@@ -1008,7 +1019,7 @@ pub const Reducer = struct {
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = terminal_reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
         } };
     }
@@ -2354,7 +2365,6 @@ test "chat completions terminal evidence and finish reasons are strict" {
     for ([_]struct { reason: []const u8, failure: Error }{
         .{ .reason = "length", .failure = error.OutputTruncated },
         .{ .reason = "content_filter", .failure = error.ContentFiltered },
-        .{ .reason = "stop", .failure = error.InconsistentFinishReason },
     }) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
@@ -2370,10 +2380,34 @@ test "chat completions terminal evidence and finish reasons are strict" {
         try test_accept(&reducer, "[DONE]");
         try std.testing.expectError(error.Refused, reducer.finish(false));
     }
+}
+
+test "chat completions reconciles a terminal reason against the streamed calls" {
+    const alloc = std.testing.allocator;
+    // A gateway that labels a reply "stop" after the model streamed a complete
+    // call keeps the call as a tool turn instead of closing the stream.
     {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
-        try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_tools_finish));
+        try test_accept(&reducer, test_call);
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqualStrings("read_file", result.completed.completion.tool_calls[0].name);
+        try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+    }
+    // A gateway that labels a reply "tool_calls" after the model streamed none
+    // delivers the prose answer as a stop completion.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"},\"finish_reason\":null}]}");
+        var result = try test_finish(&reducer, test_tools_finish);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 0), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
     }
 }
 

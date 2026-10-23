@@ -6401,7 +6401,9 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     defer v1.deinit();
     try v1.session("v1-open", &.{assistantTurn("q", "a")});
     for ([_][]const u8{ ".fx", ".fx/sessions", ".fx/sessions/v1-open" }) |path| {
-        var dir = try t.tmp.dir.openDir(io, path, .{});
+        // Iterable, so Linux opens a real descriptor: `fchmod` on an
+        // `O_PATH` handle fails with BADF instead of setting the mode.
+        var dir = try t.tmp.dir.openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
         dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
     }
@@ -6626,7 +6628,9 @@ test "a new session never takes an id v1's folder could not be checked for (D61)
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
     const io = io_mod.getIo();
-    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
+    // Iterable, so Linux opens a real descriptor: `fchmod` on an `O_PATH`
+    // handle fails with BADF instead of setting the mode.
+    var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{ .iterate = true });
     defer sessions.close(io);
     sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
     defer sessions.setPermissions(io, .fromMode(0o700)) catch {};

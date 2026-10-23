@@ -91,6 +91,22 @@ fn validate_name(name: []const u8) Error!void {
     for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidToolName;
 }
 
+/// A name the model produced. Unlike an advertised name, it is not checked
+/// against a tool list: a name fx did not offer is a model mistake the runtime
+/// answers with a tool result, which is cheaper than failing the turn. Only a
+/// name the runtime cannot safely echo back rejects the stream. Surrounding
+/// whitespace is trimmed because it is a framing artifact, not an identity the
+/// model chose.
+fn receivedToolName(name: []const u8) Error![]const u8 {
+    const trimmed = std.mem.trim(u8, name, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > max_name_bytes) return error.InvalidToolName;
+    for (trimmed) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidToolName;
+    // The name travels back to the model inside a JSON tool result, so it has
+    // to be text the result can carry.
+    if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidToolName;
+    return trimmed;
+}
+
 fn append_function(alloc: Allocator, functions: *std.ArrayList(Function), function: Function) Error!void {
     try validate_name(function.name);
     if (functions.items.len == max_selected_tools) return error.TooManyTools;
@@ -642,14 +658,18 @@ const Tool = struct {
 };
 
 /// Single-owner, request-local state machine. No I/O, callbacks, tool execution,
-/// or hidden cancellation reads. Owns all retained input (including selected
-/// names) until deinit. Any accept/finish failure poisons the reducer; deinit
-/// remains mandatory. A successful finish transfers independent owned results.
+/// or hidden cancellation reads. Owns all retained input until deinit. Any
+/// accept/finish failure poisons the reducer; deinit remains mandatory. A
+/// successful finish transfers independent owned results.
+///
+/// The reducer does not decide which tool names are callable. A well-formed
+/// name it did not advertise is model output the runtime answers with a tool
+/// result the model can correct, so only a name that cannot be handed back
+/// safely closes the stream.
 pub const Reducer = struct {
     alloc: Allocator,
     limits: Limits,
     choice: types.ToolChoice,
-    names: std.ArrayList([]u8) = .empty,
     tools: std.ArrayList(Tool) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
@@ -672,21 +692,10 @@ pub const Reducer = struct {
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
         try validate_request(request);
-        var functions = try select_functions(alloc, request.tools, request.tool_choice);
-        defer functions.deinit(alloc);
-        var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
-        errdefer self.deinit();
-        for (functions.items) |function| {
-            const name = try alloc.dupe(u8, function.name);
-            errdefer alloc.free(name);
-            try self.names.append(alloc, name);
-        }
-        return self;
+        return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
     }
 
     pub fn deinit(self: *Reducer) void {
-        for (self.names.items) |name| self.alloc.free(name);
-        self.names.deinit(self.alloc);
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.content.deinit(self.alloc);
@@ -889,18 +898,10 @@ pub const Reducer = struct {
                 if (non_null(function, "name")) |name_value| {
                     const fragment = try string(name_value);
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
-                    var prefix = false;
-                    for (self.names.items) |name| prefix = prefix or std.mem.startsWith(u8, name, tool.name.items);
-                    if (!prefix) return error.InvalidToolName;
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
-    }
-
-    fn known_name(self: *const Reducer, name: []const u8) bool {
-        for (self.names.items) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
-        return false;
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
@@ -968,7 +969,7 @@ pub const Reducer = struct {
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
-            if (!self.known_name(tool.name.items)) return error.InvalidToolName;
+            _ = try receivedToolName(tool.name.items);
             try validate_arguments(self.alloc, tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
@@ -991,7 +992,9 @@ pub const Reducer = struct {
             const id = tool.id.?;
             tool.id = null;
             errdefer self.alloc.free(id);
-            const name = try tool.name.toOwnedSlice(self.alloc);
+            const accumulated_name = try tool.name.toOwnedSlice(self.alloc);
+            defer self.alloc.free(accumulated_name);
+            const name = try self.alloc.dupe(u8, try receivedToolName(accumulated_name));
             errdefer self.alloc.free(name);
             const arguments = try tool.arguments.toOwnedSlice(self.alloc);
             errdefer self.alloc.free(arguments);
@@ -2387,7 +2390,6 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .first = test_text, .chunk = "{\"id\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_text, .chunk = "{\"model\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"other\"}]}}]}", .failure = error.ConflictingIdentity },
-        .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\"}}]}}]}", .failure = error.InvalidToolName },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
@@ -2617,7 +2619,6 @@ test "chat completions missing tool fields sparse indexes and invalid identities
         .{ .delta = "{\"index\":0,\"type\":\"invalid\"}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"type\":7}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
-        .{ .delta = "{\"index\":0,\"function\":{\"name\":\"not_advertised\"}}", .failure = error.InvalidToolName },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"arguments\":{}}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":999999999}", .failure = error.TooManyTools },
@@ -2634,22 +2635,68 @@ test "chat completions missing tool fields sparse indexes and invalid identities
     }
 }
 
-test "chat completions repeated consistent identity preserves one call and selected names are owned" {
+test "chat completions repeated consistent identity preserves one call" {
     const alloc = std.testing.allocator;
-    var request = test_request();
-    const name = try alloc.dupe(u8, "read_file");
-    defer alloc.free(name);
-    const function: model_tool_schema.FunctionSchema = .{ .name = name, .description = "Read." };
-    request.tools.additional_functions = &.{function};
-    var reducer = try Reducer.init(alloc, request, .{});
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
     defer reducer.deinit();
-    @memset(name, 'x');
     try test_accept(&reducer, test_call);
     try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"arguments\":\"\"}}]}}]}");
     var result = try test_finish(&reducer, test_tools_finish);
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+}
+
+test "chat completions hands an unadvertised tool name to the runtime" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    // The model named a tool this turn never advertised. That is model output
+    // the runtime answers with a tool result, so the stream stays usable.
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"fx\\\"}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+    try std.testing.expectEqualStrings("web_search", result.completed.completion.tool_calls[0].name);
+}
+
+test "chat completions trims a streamed name and keeps dotted identities literal" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"  shell.run\",\"arguments\":\"{}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    // A dotted name is not rewritten into an alias fx could resolve; the
+    // runtime answers it and the model corrects itself.
+    try std.testing.expectEqualStrings("shell.run", result.completed.completion.tool_calls[0].name);
+}
+
+test "chat completions rejects only names it cannot hand back" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "",
+        "   ",
+        "shell\nstop",
+        "shell\x00",
+    };
+    for (cases) |name| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        const chunk = try std.json.Stringify.valueAlloc(alloc, .{ .choices = &.{
+            .{ .index = 0, .delta = .{ .tool_calls = &.{
+                .{ .index = 0, .id = "call-1", .type = "function", .function = .{ .name = name, .arguments = "{}" } },
+            } } },
+        } }, .{});
+        defer alloc.free(chunk);
+        try test_accept(&reducer, chunk);
+        try std.testing.expectError(error.InvalidToolName, test_finish(&reducer, test_tools_finish));
+    }
+    // Bytes a JSON result cannot carry, checked without a JSON round trip.
+    try std.testing.expectError(error.InvalidToolName, receivedToolName("shell\xff"));
+    const oversized: [max_name_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidToolName, receivedToolName(&oversized));
+    try std.testing.expectEqualStrings("shell", try receivedToolName(" shell\n"));
 }
 
 test "chat completions usage conflicts late errors and post terminal data cannot succeed" {

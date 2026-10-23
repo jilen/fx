@@ -58,7 +58,7 @@ pub const terminal_unavailable_message =
 const terminal_saved_session_required_message =
     "TTY shell actions require a saved fx session.";
 const terminal_saved_session_required_suggestion =
-    "Use shell.run with tty=false, or rerun without --no-save.";
+    "Rerun without --no-save, or resend the same request with tty set to false.";
 
 pub const ToolCapabilities = struct {
     web_search_runtime_ready: bool = false,

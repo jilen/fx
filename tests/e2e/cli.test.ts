@@ -32,6 +32,7 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
+import { savedSession, sessionDir } from "./saved-sessions";
 import {
   codexBreakdownBody,
   codexProfileBody,
@@ -399,7 +400,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>
 
 Options:
   --auto                      Automatically review unresolved permission requests
@@ -420,11 +421,9 @@ Options:
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
   --no-save                   Do not save the session; incompatible with --resume and --resume-id
-  --sessions-v2               Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it
   --no-color                  Render TTY output without colors or hyperlinks
   --resume <last|id>          Continue the last session or a session by id
   --resume-id <id>            Continue a session by exact id
-  --continue-recovery         Resume the paused model response in the selected session
   --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
@@ -446,7 +445,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx session help documents inspect resume migrate and recover",
+    "fx session help documents inspect resume and recover",
     async () => {
       for (const args of [
         ["session", "--help"],
@@ -455,11 +454,13 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, migrate, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id>|--id <id>");
         expect(r.stdout).toContain("session resume [last|<id>]");
-        expect(r.stdout).toContain("session migrate <id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
+        // Sessions convert on open; there is nothing to migrate by hand.
+        expect(r.stdout).not.toContain("migrate");
+        expect(r.stdout).not.toContain("--allow-large");
       }
     },
     TIMEOUT,
@@ -1722,8 +1723,10 @@ describe("cli: doctor", () => {
             expect.objectContaining({
               name: "sessions",
               status: "ok",
+              // Sessions an older fx saved, each converted when first
+              // opened (D73).
               detail: expect.stringContaining(
-                `${sessionCount} saved session(s)`,
+                `${sessionCount} session(s) saved by an older fx`,
               ),
             }),
           ]),
@@ -2466,7 +2469,6 @@ describe("cli: missing durable home", () => {
           ["sessions", "--json"],
           ["session", "last", "--json"],
           ["session", "--id", "missing.valid-id", "--json"],
-          ["session", "migrate", "--id", "missing.valid-id", "--json"],
         ]) {
           const result = await runFx(args, { cwd, env, timeoutMs: TIMEOUT });
           expect(result.code).toBe(1);
@@ -2827,7 +2829,12 @@ describe("cli: sessions", () => {
           },
         );
         expect(detail.code).not.toBe(0);
-        expect(detail.stderr).toContain("AccessDenied");
+        expect(detail.stderr).toBe("");
+        // The damage is named, and doctor says what can be done (D78).
+        const failure = JSON.parse(detail.stdout);
+        expect(failure.code).toBe("InvalidSessionFormat");
+        expect(failure.error).toContain("AccessDenied");
+        expect(failure.error).toContain("run `fx doctor`");
         expect(snapshotTree(join(home, ".fx"))).toEqual(before);
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -4507,11 +4514,7 @@ describe("cli: ask success", () => {
         expect(
           gateway.requests[0]?.headers.get("x-vercel-gateway-extended-time"),
         ).toBe("true");
-        expect(
-          existsSync(
-            join(savedHome, ".fx", "sessions", firstJson.session_id),
-          ),
-        ).toBe(true);
+        expect(existsSync(sessionDir(savedHome, firstJson.session_id))).toBe(true);
 
         const resumed = await runFx(
           [
@@ -4609,8 +4612,8 @@ describe("cli: ask success", () => {
         const workspaceRoot = realpathSync(workspace);
         const sessionId = "legacy-ask-convert";
         writeLegacySession(home, workspaceRoot, sessionId);
-        const sessionDir = join(home, ".fx", "sessions", sessionId);
-        const legacyPath = join(sessionDir, "session.json");
+        const legacyDir = join(home, ".fx", "sessions", sessionId);
+        const legacyPath = join(legacyDir, "session.json");
         const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
         const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
         const legacySummary = "LEGACY_ONLY_EARLIER_CONTEXT: deploy to eu-west-1.";
@@ -4665,12 +4668,9 @@ describe("cli: ask success", () => {
           final_output: "LEGACY_CONVERTED_OK",
         });
 
-        const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
-        expect(metadata.schema_version).toBe(4);
-        expect(Object.hasOwn(metadata, "history")).toBe(false);
-        expect(existsSync(join(sessionDir, "authority.json"))).toBe(false);
-        expect(existsSync(join(sessionDir, "checkpoint.json"))).toBe(false);
-        expect(existsSync(join(sessionDir, "events.v3.backup"))).toBe(false);
+        // Converted once: the new store holds it, and v1's folder is gone.
+        expect(existsSync(sessionDir(home, sessionId))).toBe(true);
+        expect(existsSync(legacyDir)).toBe(false);
 
         const second = await runFx(
           ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after restart."],
@@ -4682,24 +4682,12 @@ describe("cli: ask success", () => {
           session_id: sessionId,
           final_output: "LEGACY_RESTART_OK",
         });
-        const records = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line));
-        const events = records.map((record) => Object.keys(record.event)[0]);
-        expect(events).toEqual([
-          "context_checkpoint",
-          "user",
-          "tool_call",
-          "tool_result",
+        const history = (await savedSession(home, sessionId)).history;
+        expect(history.map((turn: { kind: string }) => turn.kind)).toEqual([
+          "compacted_summary",
           "assistant",
-          "turn_completed",
-          "user",
           "assistant",
-          "turn_completed",
-          "user",
           "assistant",
-          "turn_completed",
         ]);
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
@@ -4708,12 +4696,15 @@ describe("cli: ask success", () => {
           expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
           expect(request.body).toContain(legacyOutput);
         }
-        const preserved = records.find((record) => record.event.tool_result)?.event.tool_result;
-        expect(preserved.call_id).toBe("legacy-read");
-        expect(preserved.completeness).not.toBe("complete");
-        expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
-        const files = records.find((record) => record.event.turn_completed)?.event.turn_completed.files;
-        expect(files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
+        // The old inline result keeps its bytes, but not the claim that it is
+        // complete.
+        const preserved = history[1].execution.tool_steps[0].tool_results[0];
+        expect(preserved.tool_call_id).toBe("legacy-read");
+        expect(preserved.truncated).toBe(true);
+        expect(preserved.stored_output_bytes).toBe(legacyOutput.length);
+        const blobs = join(sessionDir(home, sessionId), "blobs");
+        expect(readdirSync(blobs).some((hash) => readFileSync(join(blobs, hash), "utf8") === legacyOutput)).toBe(true);
+        expect(history[1].execution.files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
@@ -5372,8 +5363,8 @@ describe("cli: workspace access", () => {
   );
 });
 
-describe("cli: MCP profile add", () => {
-  test("status and doctor inspect MCP without transport while list --connect discovers it", async () => {
+describe("cli: MCP profile", () => {
+  test("status, doctor, and list start no MCP server, and show connects one", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -5388,7 +5379,7 @@ describe("cli: MCP profile add", () => {
           fixture: {
             type: "local",
             command: [process.execPath, MODERN_MCP_FIXTURE],
-            environment: { FX_MCP_PID_PATH: pidPath, FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+            environment: { FX_MCP_PID_PATH: pidPath },
           },
         },
       }),
@@ -5416,229 +5407,59 @@ describe("cli: MCP profile add", () => {
       );
       expect(existsSync(pidPath)).toBe(false);
 
-      const passive = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(passive.code).toBe(0);
-      expect(passive.stdout).toContain("state=disconnected");
+      const listed = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(listed.code).toBe(0);
+      expect(listed.stdout).toMatch(/fixture +~\/\.fx\/mcp\.json +stdio +not started/);
       expect(existsSync(pidPath)).toBe(false);
 
-      const connected = await runFx(
-        ["mcp", "list", "--connect"],
+      const shown = await runFx(
+        ["mcp", "show", "fixture"],
         { cwd: workspace, env, timeoutMs: TIMEOUT },
       );
-      expect(connected.code).toBe(0);
-      expect(connected.stderr).toBe("");
-      expect(connected.stdout).toContain("state=ready");
-      expect(connected.stdout).toContain("tools=1");
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      expect(shown.stdout).toContain("ready, 1 tool");
       expect(existsSync(pidPath)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("lists paths and removes profile servers without launching MCP transport", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
+  test("add refuses a profile with both mcp and mcpServers and leaves it as it was", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-keys-")));
     const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const profileMarker = join(root, "profile-launched");
-    const workspaceMarker = join(root, "workspace-launched");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace, { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
-    writeFileSync(
-      join(home, ".fx", "mcp.json"),
-      JSON.stringify({
-        mcp: {
-          shared: {
-            command: ["/bin/sh", "-c", `touch ${profileMarker}`],
-          },
-        },
-      }),
-    );
-    writeFileSync(
-      join(workspace, ".mcp.json"),
-      JSON.stringify({
-        mcpServers: {
-          shared: {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          "workspace-only": {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          broken: {
-            command: "${MISSING_LIST_COMMAND}",
-          },
-        },
-      }),
-    );
-    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    const both = JSON.stringify({
+      mcp: { alpha: { command: "alpha-server" } },
+      mcpServers: { beta: { command: "beta-server" } },
+    });
+    writeFileSync(profilePath, both, { mode: 0o600 });
     try {
-      const path = await runFx(["mcp", "path"], { cwd: workspace, env });
-      expect(path.code).toBe(0);
-      expect(path.stderr).toBe("");
-      expect(path.stdout.trim()).toBe(join(home, ".fx", "mcp.json"));
-
-      const before = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(before.code).toBe(0);
-      expect(before.stderr).toBe("");
-      expect(before.stdout).toMatch(/shared source=profile scope=profile/);
-      expect(before.stdout).toMatch(
-        /workspace-only source=workspace scope=workspace/,
-      );
-      expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
-      expect(before.stdout).not.toContain("MISSING_LIST_COMMAND");
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const removed = await runFx(["mcp", "remove", "shared"], {
-        cwd: workspace,
-        env,
-      });
-      expect(removed.code).toBe(0);
-      expect(removed.stderr).toBe("");
-      expect(removed.stdout).toContain("Removed MCP server 'shared'");
-      expect(JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8")))
-        .toEqual({ mcp: {} });
-
-      const after = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(after.code).toBe(0);
-      expect(after.stdout).toMatch(/shared source=workspace scope=workspace/);
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const missing = await runFx(["mcp", "remove", "missing"], {
-        cwd: workspace,
-        env,
-      });
-      expect(missing.code).not.toBe(0);
-      expect(missing.stderr).toContain("MCP server 'missing' was not found");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("adds local and HTTP servers without launching either server", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-add-")));
-    const home = join(root, "home");
-    const marker = join(root, "launched");
-    mkdirSync(home, { recursive: true });
-    try {
-      const help = await runFx(["mcp", "--help"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(help.code).toBe(0);
-      for (const command of [
-        "fx mcp add NAME COMMAND [ARGS...]",
-        "fx mcp auth NAME",
-        "fx mcp list",
-        "fx mcp logout NAME",
-        "fx mcp path",
-        "fx mcp remove NAME",
-        "fx mcp trust approve|reject NAME",
-        "fx mcp trust approve-all|reset",
-      ]) expect(help.stdout).toContain(command);
-
-      const local = await runFx(
-        ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      const bare = await runFx(["mcp"], { env: { HOME: home, ...NO_GATEWAY_AUTH } });
-      expect(bare.code).toBe(0);
-      expect(bare.stdout).toBe(help.stdout);
-      expect(existsSync(marker)).toBe(false);
-      const missingAuthName = await runFx(["mcp", "auth"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(missingAuthName.code).toBe(1);
-      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
-      expect(existsSync(marker)).toBe(false);
-      expect(local.code).toBe(0);
-      expect(local.stderr).toBe("");
-      expect(local.stdout).toContain("Saved MCP server 'local'");
-      expect(existsSync(marker)).toBe(false);
-
-      const remote = await runFx(
-        [
-          "mcp",
-          "add",
-          "--transport",
-          "http",
-          "remote",
-          "https://example.test/mcp",
-        ],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(remote.code).toBe(0);
-      expect(remote.stderr).toBe("");
-
-      const profile = JSON.parse(
-        readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
-      );
-      expect(profile).not.toHaveProperty("mcpServers");
-      expect(profile.mcp.local.command).toEqual([
-        "/bin/sh",
-        "-c",
-        `touch ${marker}`,
-      ]);
-      expect(profile.mcp.remote).toMatchObject({
-        type: "http",
-        url: "https://example.test/mcp",
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("canonicalizes alias input and refuses ambiguous server-like keys", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-alias-")));
-    const home = join(root, "home");
-    const fxDir = join(home, ".fx");
-    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-    const profilePath = join(fxDir, "mcp.json");
-    try {
-      writeFileSync(
-        profilePath,
-        JSON.stringify({ mcpServers: { old: { command: "old-server" } } }),
-        { mode: 0o600 },
-      );
-      const migrated = await runFx(
-        ["mcp", "add", "new", "new-server"],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(migrated.code).toBe(0);
-      const canonical = JSON.parse(readFileSync(profilePath, "utf8"));
-      expect(Object.keys(canonical.mcp).sort()).toEqual(["new", "old"]);
-      expect(canonical).not.toHaveProperty("mcpServers");
-
-      const ambiguous = JSON.stringify({
-        mcp: { canonical: { command: "canonical-server" } },
-        "MCP-Servers": { blocked: { command: "blocked-server" } },
-        metadata: { owner: "team" },
-      });
-      writeFileSync(profilePath, ambiguous, { mode: 0o600 });
       const refused = await runFx(
-        ["mcp", "add", "unsafe", "must-not-save"],
+        ["mcp", "add", "gamma", "--", "gamma-server"],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
-      expect(refused.code).not.toBe(0);
-      expect(refused.stderr).toContain("McpConfigAmbiguousServerKey");
-      expect(readFileSync(profilePath, "utf8")).toBe(ambiguous);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toBe(
+          "Couldn't add gamma to ~/.fx/mcp.json: the file has both \"mcp\" and \"mcpServers\"; merge them into one.\n",
+      );
+      expect(readFileSync(profilePath, "utf8")).toBe(both);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("serializes concurrent different-name additions", async () => {
+  test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");
     mkdirSync(home, { recursive: true });
     try {
       const [first, second] = await Promise.all([
-        runFx(["mcp", "add", "first", "first-server"], {
+        runFx(["mcp", "add", "first", "--", "first-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
-        runFx(["mcp", "add", "second", "second-server"], {
+        runFx(["mcp", "add", "second", "--", "second-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
       ]);
@@ -5647,24 +5468,24 @@ describe("cli: MCP profile add", () => {
       const profile = JSON.parse(
         readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
       );
-      expect(Object.keys(profile.mcp).sort()).toEqual(["first", "second"]);
+      expect(Object.keys(profile.mcpServers).sort()).toEqual(["first", "second"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("fails precisely without HOME or valid add syntax", async () => {
-    const missingHome = await runFx(["mcp", "add", "fixture", "node"], {
+  test("add fails precisely without HOME and on a flag it doesn't have", async () => {
+    const missingHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
-    expect(missingHome.code).not.toBe(0);
-    expect(missingHome.stderr).toContain("HomeNotSet");
+    expect(missingHome.code).toBe(1);
+    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
 
-    const invalid = await runFx(
+    const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],
       { env: { HOME: tmpdir(), ...NO_GATEWAY_AUTH } },
     );
-    expect(invalid.code).not.toBe(0);
-    expect(invalid.stderr).toContain("mcp add NAME COMMAND");
+    expect(flagged.code).toBe(2);
+    expect(flagged.stderr).toStartWith("fx mcp add has no --transport flag.\nusage: fx mcp add");
   });
 });

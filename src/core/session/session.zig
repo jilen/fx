@@ -220,12 +220,12 @@ pub fn collect_image_catalog(
 
     for (canonical_history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
-            catalog[copied] = try dupeImageAttachment(alloc, attachment);
+            catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
             copied += 1;
         }
     }
     for (current_images) |attachment| {
-        catalog[copied] = try dupeImageAttachment(alloc, attachment);
+        catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
 
@@ -278,12 +278,12 @@ pub fn merge_image_catalog_history_turn(
         core_types.freeImageAttachment(alloc, attachment);
     };
     for (catalog) |attachment| {
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     for (additions) |attachment| {
         if (image_attachment_for_id(catalog, attachment.id) != null) continue;
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     sort_utils.sort(ImageAttachment, merged, {}, image_id_less_than);
@@ -342,14 +342,6 @@ fn mutable_images_for_history_turn(turn: *HistoryTurn) []ImageAttachment {
         .compacted_summary => &.{},
         .assistant => |*entry| entry.user.images,
         .interrupted => |*entry| entry.user.images,
-    };
-}
-
-fn mutable_images_slice_for_history_turn(turn: *HistoryTurn) ?*[]ImageAttachment {
-    return switch (turn.*) {
-        .compacted_summary => null,
-        .assistant => |*entry| &entry.user.images,
-        .interrupted => |*entry| &entry.user.images,
     };
 }
 
@@ -553,160 +545,6 @@ pub fn repair_legacy_zero_image_ids(
     return true;
 }
 
-pub fn repair_legacy_image_snapshots(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) Allocator.Error!bool {
-    const snapshot_dir_existed = snapshot_directory_exists(snapshot_dir);
-    const candidate = try alloc.alloc(HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (candidate[0..copied]) |turn| freeHistoryTurn(alloc, turn);
-        alloc.free(candidate);
-    }
-    while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
-    }
-
-    const changed = repair_legacy_image_snapshots_in_place(
-        alloc,
-        candidate,
-        snapshot_dir,
-    ) catch |err| {
-        cleanup_candidate_snapshot_files(candidate, history);
-        if (!snapshot_dir_existed) remove_empty_snapshot_directory(snapshot_dir);
-        return err;
-    };
-    if (!changed) {
-        freeHistoryTurnSlice(alloc, candidate);
-        return false;
-    }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
-}
-
-pub fn repair_legacy_images_transactionally(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) (Allocator.Error || error{ImageIdOverflow})!bool {
-    const candidate = try alloc.alloc(HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (candidate[0..copied]) |turn| freeHistoryTurn(alloc, turn);
-        alloc.free(candidate);
-    }
-    while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
-    }
-
-    const ids_changed = try repair_legacy_zero_image_ids(alloc, candidate);
-    const snapshots_changed = try repair_legacy_image_snapshots(
-        alloc,
-        candidate,
-        snapshot_dir,
-    );
-    if (!ids_changed and !snapshots_changed) {
-        freeHistoryTurnSlice(alloc, candidate);
-        return false;
-    }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
-}
-
-fn snapshot_directory_exists(path: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    dir.close(io_mod.getIo());
-    return true;
-}
-
-fn remove_empty_snapshot_directory(path: []const u8) void {
-    std.Io.Dir.deleteDirAbsolute(io_mod.getIo(), path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf(
-            "session",
-            "event=legacy_snapshot_directory_cleanup_failed err={s}",
-            .{@errorName(err)},
-        ),
-    };
-}
-
-fn repair_legacy_image_snapshots_in_place(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) Allocator.Error!bool {
-    var changed = false;
-    for (history) |*turn| {
-        const images_ptr = mutable_images_slice_for_history_turn(turn) orelse continue;
-        if (images_ptr.*.len == 0) continue;
-
-        var drop_indexes: std.ArrayList(usize) = .empty;
-        defer drop_indexes.deinit(alloc);
-        for (images_ptr.*, 0..) |*image, image_index| {
-            if (image.snapshot_path != null and image.snapshot_sha256 != null) continue;
-            image_attachments.captureImageSnapshot(alloc, image, snapshot_dir) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf(
-                        "session",
-                        "legacy image snapshot unavailable id={d} err={s}",
-                        .{ image.id, @errorName(err) },
-                    );
-                    try drop_indexes.append(alloc, image_index);
-                    continue;
-                },
-            };
-            changed = true;
-        }
-        if (drop_indexes.items.len == 0) continue;
-
-        const retained_len = images_ptr.*.len - drop_indexes.items.len;
-        var retained: []ImageAttachment = if (retained_len > 0)
-            try alloc.alloc(ImageAttachment, retained_len)
-        else
-            &.{};
-        var retained_index: usize = 0;
-        var drop_cursor: usize = 0;
-        for (images_ptr.*, 0..) |image, image_index| {
-            const drop = drop_cursor < drop_indexes.items.len and
-                drop_indexes.items[drop_cursor] == image_index;
-            if (drop) {
-                core_types.freeImageAttachment(alloc, image);
-                drop_cursor += 1;
-                continue;
-            }
-            retained[retained_index] = image;
-            retained_index += 1;
-        }
-        alloc.free(images_ptr.*);
-        images_ptr.* = retained;
-        changed = true;
-    }
-    return changed;
-}
-
-fn cleanup_candidate_snapshot_files(
-    candidate: []const HistoryTurn,
-    original: []const HistoryTurn,
-) void {
-    for (candidate, original) |candidate_turn, original_turn| {
-        image_attachments.deleteUnreferencedImageSnapshots(
-            images_for_history_turn(candidate_turn),
-            images_for_history_turn(original_turn),
-        );
-    }
-}
-
 fn make_owned_legacy_image_turn(
     alloc: Allocator,
     text: []const u8,
@@ -720,141 +558,6 @@ fn make_owned_legacy_image_turn(
         .media_type = @constCast("image/png"),
     }});
     return turn;
-}
-
-fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
-}
-
-fn writeSessionTestImage(
-    alloc: Allocator,
-    tmp: *std.testing.TmpDir,
-    name: []const u8,
-    data: []const u8,
-) ![]u8 {
-    {
-        var file = try tmp.dir.createFile(std.testing.io, name, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, data);
-    }
-    return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-}
-
-test "legacy image snapshot repair captures available path once" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const image_a = "\x89PNG\r\n\x1a\nlegacy-a";
-    const image_b = "\x89PNG\r\n\x1a\nlegacy-b";
-    const path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_a);
-    defer alloc.free(path);
-    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
-    defer alloc.free(snapshot_dir);
-    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", path);
-    var turn_owned = true;
-    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
-    turn.assistant.user.images[0].id = 1;
-    var history = [_]HistoryTurn{turn};
-    defer freeHistoryTurn(alloc, history[0]);
-    turn_owned = false;
-
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_path != null);
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_sha256 != null);
-    const replaced_path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_b);
-    defer alloc.free(replaced_path);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try image_attachments.writeImageFilePartJson(alloc, &out.writer, history[0].assistant.user.images[0]);
-    var expected_buf: [128]u8 = undefined;
-    const expected = std.base64.standard.Encoder.encode(&expected_buf, image_a);
-    var unexpected_buf: [128]u8 = undefined;
-    const unexpected = std.base64.standard.Encoder.encode(&unexpected_buf, image_b);
-    try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), unexpected) == null);
-}
-
-test "legacy image snapshot repair drops unavailable path-only images" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const missing_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
-    defer alloc.free(missing_path);
-    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
-    defer alloc.free(snapshot_dir);
-    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", missing_path);
-    var turn_owned = true;
-    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
-    turn.assistant.user.images[0].id = 1;
-    var history = [_]HistoryTurn{turn};
-    defer freeHistoryTurn(alloc, history[0]);
-    turn_owned = false;
-
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expectEqual(@as(usize, 0), history[0].assistant.user.images.len);
-}
-
-test "legacy image snapshot repair propagates OOM without changing memory or disk" {
-    const alloc = testing_allocator.no_resize;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const image_bytes = "\x89PNG\r\n\x1a\nlegacy-oom";
-    const path = try writeSessionTestImage(alloc, &tmp, "legacy-oom.png", image_bytes);
-    defer alloc.free(path);
-    var reached_success = false;
-    for (0..256) |fail_index| {
-        var name_buf: [64]u8 = undefined;
-        const snapshot_name = try std.mem.print(
-            &name_buf,
-            "snapshots-{d}",
-            .{fail_index},
-        );
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, snapshot_name });
-        defer alloc.free(snapshot_dir);
-        const turn = try make_owned_legacy_image_turn(
-            alloc,
-            "legacy [Image #1]",
-            "answer",
-            path,
-        );
-        var history = [_]HistoryTurn{turn};
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-
-        if (repair_legacy_images_transactionally(
-            failing.allocator(),
-            &history,
-            snapshot_dir,
-        )) |changed| {
-            try std.testing.expect(changed);
-            try std.testing.expect(!failing.has_induced_failure);
-            freeHistoryTurn(failing.allocator(), history[0]);
-            reached_success = true;
-            break;
-        } else |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            try std.testing.expect(failing.has_induced_failure);
-            try std.testing.expectEqualStrings("legacy [Image #1]", history[0].assistant.user.text);
-            try std.testing.expectEqual(@as(usize, 1), history[0].assistant.user.images.len);
-            const image = history[0].assistant.user.images[0];
-            try std.testing.expectEqual(@as(usize, 0), image.id);
-            try std.testing.expectEqualStrings(path, image.path);
-            try std.testing.expect(image.snapshot_path == null);
-            try std.testing.expect(image.snapshot_sha256 == null);
-            try std.testing.expectError(
-                error.FileNotFound,
-                std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }),
-            );
-            freeHistoryTurn(alloc, history[0]);
-        }
-    }
-    try std.testing.expect(reached_success);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
@@ -1798,17 +1501,8 @@ pub const SessionRuntime = struct {
         self.permission_state.deinit(alloc);
     }
 
-    pub fn configureWebFetchArtifacts(self: *SessionRuntime, alloc: Allocator, session_dir: []const u8) void {
-        self.clearWebFetchArtifacts();
-        const store = web_fetch_artifacts.Store.init(alloc, session_dir) catch |err| {
-            self.web_fetch_artifacts = .{ .unavailable = err };
-            return;
-        };
-        self.web_fetch_artifacts = .{ .store = store };
-    }
-
-    /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
-    /// are its blobs (D44, D49).
+    /// Keeps a v2 session's web-fetch downloads as its blobs (D44, D49), or
+    /// records why they can't be kept.
     pub fn configureWebFetchArtifactBlobs(
         self: *SessionRuntime,
         alloc: Allocator,
@@ -2120,45 +1814,7 @@ pub fn freeHistoryTurnSlice(alloc: Allocator, turns: []HistoryTurn) void {
     if (turns.len > 0) alloc.free(turns);
 }
 /// Deep-copies an image attachment slice; caller owns the returned slice and frees with freeImageAttachmentSlice.
-pub fn dupeImageAttachmentSlice(alloc: Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
-    if (attachments.len == 0) return &.{};
-    const copy = try alloc.alloc(ImageAttachment, attachments.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            core_types.freeImageAttachment(alloc, copy[i]);
-        }
-    }
-    for (attachments, 0..) |attachment, i| {
-        copy[i] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    return copy;
-}
-fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment {
-    const path = try alloc.dupe(u8, src.path);
-    errdefer alloc.free(path);
-    const media_type = try alloc.dupe(u8, src.media_type);
-    errdefer alloc.free(media_type);
-    const snapshot_path = if (src.snapshot_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    const snapshot_sha256 = if (src.snapshot_sha256) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    return .{
-        .id = src.id,
-        .path = path,
-        .media_type = media_type,
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = snapshot_sha256,
-    };
-}
+pub const dupeImageAttachmentSlice = core_types.dupeImageAttachmentSlice;
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
 pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
@@ -2900,27 +2556,6 @@ test "appendHistoryMessages frees owned projection text when append fails" {
     var compact_failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
-}
-test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    }));
-}
-test "dupeImageAttachment preserves stable image id" {
-    const alloc = std.testing.allocator;
-    const copy = try dupeImageAttachment(alloc, .{
-        .id = 41,
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    });
-    defer {
-        alloc.free(copy.path);
-        alloc.free(copy.media_type);
-    }
-
-    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 test "conversation-language inference matches script signals" {
     try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("puoi aprire la landing page", ConversationLanguage.default()));
@@ -4624,6 +4259,35 @@ test "active context and image catalog retain historical images" {
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
     try std.testing.expectEqual(@as(usize, 3), catalog[0].id);
     try std.testing.expectEqualStrings("/tmp/historical.png", catalog[0].path);
+}
+
+test "the image catalog keeps each image's handle and bytes, so Vision can read a resumed one (D89)" {
+    const alloc = std.testing.allocator;
+    const digest = "abababababababababababababababababababababababababababababababab";
+    var resumed = [_]ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/example/old.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(digest),
+        .blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/" ++ digest),
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old image"), .images = &resumed },
+        .assistant = @constCast("old answer"),
+    } }};
+    var unsaved_bytes = "png".*;
+    const current = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/Users/example/new.png"),
+        .media_type = @constCast("image/png"),
+        .inline_data = &unsaved_bytes,
+        .source_ref = @constCast("host:new"),
+    }};
+    const catalog = try collect_image_catalog(alloc, &history, &current);
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    try std.testing.expectEqualStrings(resumed[0].blob_path.?, catalog[0].blob_path.?);
+    try std.testing.expectEqualStrings("png", catalog[1].inline_data.?);
+    try std.testing.expectEqualStrings("host:new", catalog[1].source_ref.?);
 }
 
 test "full image catalog merges canonical history and current images" {

@@ -3311,29 +3311,11 @@ test "persisted file index paints a stale preview and the real scan replaces it"
         file.close(zio);
     }
 
-    const empty_environ = struct {
-        var map: ?*std.process.Environ.Map = null;
-        fn get() !*const std.process.Environ.Map {
-            if (map) |value| return value;
-            const value = try std.heap.page_allocator.create(std.process.Environ.Map);
-            value.* = std.process.Environ.Map.init(std.heap.page_allocator);
-            map = value;
-            return value;
-        }
-    };
-    {
-        const empty = try empty_environ.get();
-        io_mod.setEnvironMap(empty);
-    }
     var home_map = std.process.Environ.Map.init(alloc);
     defer home_map.deinit();
     try home_map.put("HOME", home);
     io_mod.setEnvironMap(&home_map);
-    defer {
-        if (empty_environ.get()) |empty| {
-            io_mod.setEnvironMap(empty);
-        } else |_| {}
-    }
+    defer io_mod.resetEnvironForTest();
 
     const scope = workspace_access.AccessScope.primaryOnly(root);
     const roots = [_][]const u8{root};
@@ -4256,7 +4238,7 @@ test "deinit cancels and joins one loader while suppressing queued refresh" {
 
 test "file index raw-list and Unicode query bytes remain bounded" {
     try std.testing.fuzz({}, fuzzRawListAndQuery, .{
-        .corpus = &.{
+        .corpus = &(.{
             "safe.txt\x00ärger",
             "escape-\x1b[2J.txt\x00\xff",
             "Ärger-file.txt\x00ärger",
@@ -4265,7 +4247,7 @@ test "file index raw-list and Unicode query bytes remain bounded" {
             "docs/Cafe\u{0301}.txt\x00e\u{0301}",
             "src/axaya.zig\x00aaa",
             "truncated.txt\x00\xc3",
-        },
+        } ++ @import("fuzz_corpus").file_index.*),
     });
 }
 

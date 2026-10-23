@@ -29,7 +29,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
@@ -50,11 +50,9 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
             .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
             .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume and --resume-id" },
-            .{ .flag = "--sessions-v2", .description = "Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it" },
             .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks" },
             .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
             .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id" },
-            .{ .flag = "--continue-recovery", .description = "Resume the paused model response in the selected session" },
             .{ .flag = "--", .description = "Treat every following argument as prompt text" },
         },
         .details = &.{
@@ -146,23 +144,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .mcp,
         .token = "mcp",
         .usage = "mcp <command> ...",
+        // `fx mcp -h` is the verbs' own help (`mcp_host/verbs.zig` writeUsage).
         .summary = "Manage MCP servers without opening the interactive shell",
-        .details = &.{
-            "Commands:",
-            "  fx mcp add slack                   Configure Slack and open authorization",
-            "  fx mcp add NAME COMMAND [ARGS...]",
-            "  fx mcp add --transport http NAME URL",
-            "  fx " ++ command_specs.mcp_auth_usage,
-            "  fx mcp list [--connect]",
-            "  fx mcp logout NAME",
-            "  fx mcp path",
-            "  fx mcp remove NAME",
-            "  fx mcp trust approve|reject NAME",
-            "  fx mcp trust approve-all|reset",
-            "",
-            "By default, list reads configuration without opening MCP transports.",
-            "Use --connect to connect and discover servers before rendering health.",
-        },
     },
     .{
         .kind = .models,
@@ -193,15 +176,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session migrate <id>|--id <id> [--allow-large] [--json] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, migrate, or recover saved sessions",
+        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session resume --id <id> | session recover <id>|--id <id> [--json]",
+        .summary = "Inspect, resume, or recover saved sessions",
         .options = &.{
             .{ .flag = "last", .description = "Inspect the current workspace session" },
             .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
             .{ .flag = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
-            .{ .flag = "migrate <id>", .description = "Migrate a saved session to the current format" },
             .{ .flag = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
-            .{ .flag = "--allow-large", .description = "Permit migrating an oversized session" },
             json_option,
         },
     },
@@ -312,7 +293,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
-        .{ .usage = "session migrate <id>", .summary = "Migrate a saved session to the current format" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
@@ -394,10 +374,6 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--resume-<id>",
         .description = "Resume a session by exact ID",
-    },
-    .{
-        .usage = "--sessions-v2",
-        .description = "Use the experimental v2 session store, also set by FX_SESSIONS_V2=1",
     },
     .{
         .usage = "-h, --help",
@@ -482,7 +458,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]", .completion_description = "manage local and remote MCP servers, resources, prompts, and project trust", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },

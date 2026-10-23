@@ -250,8 +250,10 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
     for (0..16) |_| {
         var suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&suffix));
+        // Fixed width, so the model's note naming a snapshot here is the
+        // same length in every process.
         const path = try alloc.print(
-            "{s}/fx-image-snapshots-{x}",
+            "{s}/fx-image-snapshots-{x:0>16}",
             .{ temp_root, suffix },
         );
         errdefer alloc.free(path);
@@ -814,18 +816,18 @@ fn attachmentDimensions(
     attachment: types.ImageAttachment,
 ) std.mem.Allocator.Error!?image_data.Dimensions {
     if (attachment.inline_data) |bytes| return image_data.imageDimensions(bytes);
-    const path = attachment.snapshot_path orelse return null;
-    const digest = attachment.snapshot_sha256 orelse return probeSnapshotDimensions(path);
+    const source = imageFile(attachment) orelse return null;
+    const digest = attachment.snapshot_sha256 orelse return probeSnapshotDimensions(source);
     if (cache.get(digest)) |cached| return cached;
-    const dimensions = probeSnapshotDimensions(path);
+    const dimensions = probeSnapshotDimensions(source);
     const key = try cache_alloc.dupe(u8, digest);
     errdefer cache_alloc.free(key);
     try cache.put(cache_alloc, key, dimensions);
     return dimensions;
 }
 
-fn probeSnapshotDimensions(path: []const u8) ?image_data.Dimensions {
-    var file = openSnapshotFileNoFollow(path) catch return null;
+fn probeSnapshotDimensions(source: ImageFile) ?image_data.Dimensions {
+    var file = source.open() catch return null;
     defer file.close(io_mod.getIo());
     const reader: SnapshotFileReader = .{ .file = file };
     return reader.dimensions();
@@ -833,11 +835,11 @@ fn probeSnapshotDimensions(path: []const u8) ?image_data.Dimensions {
 
 fn attachmentRawBytes(attachment: types.ImageAttachment) ?usize {
     if (attachment.inline_data) |bytes| return bytes.len;
-    const path = attachment.snapshot_path orelse return null;
-    var file = openSnapshotFileNoFollow(path) catch return null;
+    const source = imageFile(attachment) orelse return null;
+    var file = source.open() catch return null;
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch return null;
-    if (stat.kind != .file or stat.nlink != 1) return null;
+    if (!source.accepts(stat)) return null;
     return std.math.cast(usize, stat.size);
 }
 
@@ -917,7 +919,7 @@ fn writeWithheldAttachmentNotice(
 ) std.Io.Writer.Error!void {
     if (dimensions) |size| {
         try writer.print("[Image #{d} not sent: {s} is {d}x{d} pixels. This request permits at most {d} per side and 5 MiB encoded per image. ", .{ attachment.id, attachment.media_type, size.width, size.height, max_dimension });
-    } else if (attachment.source_ref != null and attachment.inline_data == null and attachment.snapshot_path == null) {
+    } else if (attachment.source_ref != null and attachment.inline_data == null and imageFile(attachment) == null) {
         try writer.print("[Image #{d} not sent: only a host source reference was supplied. This request permits at most {d} per side and 5 MiB encoded per image. ", .{ attachment.id, max_dimension });
     } else {
         try writer.print("[Image #{d} not sent: its dimensions could not be verified. ", .{attachment.id});
@@ -926,17 +928,15 @@ fn writeWithheldAttachmentNotice(
         try image_data.writeHostImageRecoveryNotice(writer, source_ref, max_dimension);
         return;
     }
-    if (attachment.inline_data == null) {
-        if (attachment.snapshot_path) |path| {
-            try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
-            // Snapshots are named .bin, which hides the type from tools
-            // that choose a decoder by file name.
-            if (mediaTypeExtension(attachment.media_type)) |extension| {
-                try writer.print(" ending in {s}", .{extension});
-            }
-            try writer.writeAll(", then read_file the copy. If no image tool is available, ask the user before installing one.]\n");
-            return;
+    if (savedImagePath(attachment)) |path| {
+        try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
+        // Saved files are named .bin or by their hash, which hides the type
+        // from tools that choose a decoder by file name.
+        if (mediaTypeExtension(attachment.media_type)) |extension| {
+            try writer.print(" ending in {s}", .{extension});
         }
+        try writer.writeAll(", then read_file the copy. If no image tool is available, ask the user before installing one.]\n");
+        return;
     }
     try writer.writeAll("No local image file is available; ask the user for a smaller copy.]\n");
 }
@@ -958,9 +958,10 @@ pub const AttachmentProjection = struct {
     messages: []const types.ChatMessage,
 };
 
-/// Leaves unsafe attachments out of the request and gives the model a source
-/// path when one exists. History is not modified. `cache` and its keys use
-/// `cache_alloc` and should outlive the requests of one turn.
+/// Leaves unsafe attachments out of the request and gives the model the
+/// path of each one's saved copy (`savedImagePath`) when it has one.
+/// History is not modified. `cache` and its keys use `cache_alloc` and
+/// should outlive the requests of one turn.
 pub fn withholdOversizedAttachments(
     arena: std.mem.Allocator,
     cache_alloc: std.mem.Allocator,
@@ -994,6 +995,42 @@ pub fn withholdOversizedAttachments(
         projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
     }
     return .{ .messages = result orelse messages };
+}
+
+/// The file the model may open for `image`, or null: a session's blob
+/// (D89), otherwise the snapshot of an image not held inline. Inline bytes
+/// without a blob own the image, and a snapshot beside them lasts only as
+/// long as the process.
+pub fn savedImagePath(image: types.ImageAttachment) ?[]const u8 {
+    if (image.blob_path) |path| return path;
+    if (image.inline_data != null) return null;
+    return image.snapshot_path;
+}
+
+/// Names the saved file behind each image a request sends, so the model can
+/// open the image it sees with tools instead of searching the disk for it.
+/// Only the session's own copy is named, never the path the user attached
+/// from: that file can change after it was attached, and the copy holds
+/// the bytes the model sees (`savedImagePath`). Returns `messages` itself
+/// when no image has a saved file, otherwise a copy allocated in `arena`.
+/// History is not modified.
+pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types.ChatMessage) ![]const types.ChatMessage {
+    var result: ?[]types.ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        var notes: std.Io.Writer.Allocating = .init(arena);
+        for (message.images) |image| {
+            const path = savedImagePath(image) orelse continue;
+            // Quoted, because a home folder can hold spaces or brackets.
+            notes.writer.print("[Image #{d} ({s}) is saved at ", .{ image.id, image.media_type }) catch return error.OutOfMemory;
+            std.json.Stringify.value(path, .{}, &notes.writer) catch return error.OutOfMemory;
+            notes.writer.writeAll(".]\n") catch return error.OutOfMemory;
+        }
+        if (notes.written().len == 0) continue;
+        const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+        result = projected;
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notes.written(), message.content orelse "" });
+    }
+    return result orelse messages;
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
@@ -1124,6 +1161,41 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
     };
 }
 
+/// The file that holds an image's bytes when they are not inline: the blob
+/// its session saved it as (D89), or else its captured snapshot. Readers
+/// check the bytes against the image's digest either way.
+const ImageFile = struct {
+    path: []const u8,
+    /// A fork hard-links its source's blobs (D44), so a blob may have more
+    /// than one link. A snapshot in the shared temporary folder must have
+    /// only its own.
+    blob: bool,
+
+    /// Whether `stat` is a file this source may be read from.
+    fn accepts(source: ImageFile, stat: std.Io.File.Stat) bool {
+        return stat.kind == .file and (source.blob or stat.nlink == 1);
+    }
+
+    /// A blob is in fx's own private store, so the folders on its path are
+    /// opened as the path names them, symlinks and all. A snapshot in the
+    /// shared temporary folder has no symlink anywhere on its path. Neither
+    /// file may itself be a symlink.
+    fn open(source: ImageFile) !std.Io.File {
+        if (!source.blob) return openSnapshotFileNoFollow(source.path);
+        if (!std.Io.Dir.path.isAbsolute(source.path)) return error.ImageSnapshotPathUnsafe;
+        return std.Io.Dir.openFileAbsolute(io_mod.getIo(), source.path, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        }) catch |err| return unsafeSnapshotPathError(err);
+    }
+};
+
+fn imageFile(attachment: types.ImageAttachment) ?ImageFile {
+    if (attachment.blob_path) |path| return .{ .path = path, .blob = true };
+    if (attachment.snapshot_path) |path| return .{ .path = path, .blob = false };
+    return null;
+}
+
 fn openSnapshotFileNoFollow(path: []const u8) !std.Io.File {
     if (!std.Io.Dir.path.isAbsolute(path)) return error.ImageSnapshotPathUnsafe;
     const parent_path = std.Io.Dir.path.dirname(path) orelse return error.ImageSnapshotPathUnsafe;
@@ -1161,15 +1233,15 @@ pub fn loadVerifiedSnapshot(
             .media_type = detected,
         };
     }
-    const path = attachment.snapshot_path orelse return error.MissingImageSnapshot;
+    const source = imageFile(attachment) orelse return error.MissingImageSnapshot;
     const expected = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
     if (expected.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
     try budget.check();
 
-    var file = try openSnapshotFileNoFollow(path);
+    var file = try source.open();
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.NotRegularFile;
+    if (!source.accepts(stat)) return error.NotRegularFile;
     const size = std.math.cast(usize, stat.size) orelse return error.ImageTooLarge;
     if (size > max_image_bytes) return error.ImageTooLarge;
 
@@ -1204,9 +1276,11 @@ pub fn loadVerifiedSnapshot(
 
 /// Keeps a captured snapshot's verified bytes on the attachment itself, as
 /// an in-memory capture does, so durable serializers save them with the
-/// turn: a v2 session keeps its prompt images inside the user's item (D44).
-/// The capture still went through the platform resizer; its temporary
-/// snapshot file stays until the process's snapshot folder is removed.
+/// turn: a v2 session, which is not on disk at capture (D44), saves them as
+/// its own blob when the turn starts, or inside the user's item when it
+/// cannot (D89). The capture still went through the platform resizer; its
+/// temporary snapshot file stays until the process's snapshot folder is
+/// removed.
 pub fn inlineCapturedSnapshot(alloc: std.mem.Allocator, attachment: *types.ImageAttachment) !void {
     if (attachment.inline_data != null) return;
     const verified = try loadVerifiedSnapshot(alloc, attachment.*, .{});
@@ -1219,13 +1293,33 @@ pub fn inlineCapturedSnapshots(alloc: std.mem.Allocator, attachments: []types.Im
 }
 
 /// Returns a new attachment with independently owned snapshot bytes for `new_id`.
-/// The source snapshot remains owned by the caller.
+/// The source snapshot remains owned by the caller. An image whose bytes are
+/// inline or in its session's blob is those bytes (D84), so its clone
+/// carries them inline and writes no file: a saved session then saves it as
+/// a blob as it does any prompt image, where a copy in the process's
+/// temporary folder would be gone once fx exits (D89).
 pub fn cloneVerifiedImageAttachment(
     alloc: std.mem.Allocator,
     attachment: types.ImageAttachment,
     new_id: usize,
 ) !types.ImageAttachment {
     if (new_id == 0) return error.InvalidImageId;
+    if (attachment.inline_data != null or attachment.blob_path != null) {
+        const digest = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
+        var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+        errdefer verified.deinit(alloc);
+        const path = try alloc.dupe(u8, attachment.path);
+        errdefer alloc.free(path);
+        const media_type = try alloc.dupe(u8, verified.media_type);
+        errdefer alloc.free(media_type);
+        return .{
+            .id = new_id,
+            .path = path,
+            .media_type = media_type,
+            .snapshot_sha256 = try alloc.dupe(u8, digest),
+            .inline_data = verified.bytes,
+        };
+    }
     const source_snapshot_path = attachment.snapshot_path orelse
         return error.MissingImageSnapshot;
     const snapshot_dir = std.Io.Dir.path.dirname(source_snapshot_path) orelse
@@ -1238,7 +1332,7 @@ pub fn cloneVerifiedImageAttachment(
     );
 }
 
-pub fn copyVerifiedImageAttachmentToDir(
+fn copyVerifiedImageAttachmentToDir(
     alloc: std.mem.Allocator,
     attachment: types.ImageAttachment,
     new_id: usize,
@@ -3518,6 +3612,94 @@ test "requests leave out images the session dropped, each with a note" {
     try std.testing.expect((try withholdDroppedImages(arena, &kept)).ptr == (&kept).ptr);
 }
 
+test "requests name the saved file of each attached image, never its source" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Clean Shot.png", .data = &image_data.testPngHeader(10, 10) });
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "Clean Shot.png");
+    defer alloc.free(source_path);
+    const attached = try testCapturedAttachment(alloc, &tmp, source_path, 1, "image/png");
+    defer types.freeImageAttachment(alloc, attached);
+    // A pasted image shows its own snapshot.
+    var pasted = attached;
+    pasted.id = 2;
+    pasted.path = attached.snapshot_path.?;
+    // Recalling a prompt saves another snapshot of the same bytes.
+    const recalled_file = try cloneVerifiedImageAttachment(alloc, attached, 3);
+    defer discardImageAttachment(alloc, recalled_file);
+    const recalled_paste = try cloneVerifiedImageAttachment(alloc, pasted, 4);
+    defer discardImageAttachment(alloc, recalled_paste);
+    // Inline bytes own the image, and any snapshot beside them is temporary.
+    var inline_bytes = attached;
+    inline_bytes.id = 5;
+    inline_bytes.inline_data = @constCast("png");
+    const in_memory: types.ImageAttachment = .{ .id = 6, .path = @constCast("inline://image-6"), .media_type = @constCast("image/png"), .snapshot_sha256 = attached.snapshot_sha256, .inline_data = @constCast("png") };
+    // A v2 session's image keeps its bytes inline and is saved as its blob
+    // (D89); the note names the blob, never the temporary snapshot.
+    var in_blob = inline_bytes;
+    in_blob.id = 7;
+    in_blob.blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+
+    const images = [_]types.ImageAttachment{ attached, pasted, recalled_file, recalled_paste, inline_bytes, in_memory, in_blob };
+    const prompt = "[Image #1] [Image #2] [Image #3] [Image #4] [Image #5] [Image #6] [Image #7]";
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = prompt, .images = &images },
+        .{ .role = .assistant, .content = "ok" },
+    };
+    const projected = try noteAttachmentLocations(arena, &messages);
+
+    const expected = try arena.print(
+        "[Image #1 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #2 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #3 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #4 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #7 (image/png) is saved at \"{s}\".]\n" ++
+            prompt,
+        .{ attached.snapshot_path.?, attached.snapshot_path.?, recalled_file.snapshot_path.?, recalled_paste.snapshot_path.?, in_blob.blob_path.? },
+    );
+    try std.testing.expectEqualStrings(expected, projected[0].content.?);
+    try std.testing.expect(std.mem.find(u8, projected[0].content.?, source_path) == null);
+    try std.testing.expectEqual(@as(usize, 7), projected[0].images.len);
+    try std.testing.expectEqualStrings("ok", projected[1].content.?);
+    try std.testing.expectEqualStrings(prompt, messages[0].content.?);
+    // A request whose images have no saved file passes through untouched.
+    const unsaved = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #5] [Image #6]", .images = images[4..6] }};
+    try std.testing.expect((try noteAttachmentLocations(arena, &unsaved)).ptr == (&unsaved).ptr);
+}
+
+test "temporary snapshot folders have names of one length" {
+    const alloc = std.testing.allocator;
+    for (0..8) |_| {
+        const path = try createTempSnapshotDir(alloc);
+        defer alloc.free(path);
+        defer cleanupSnapshotDir(path);
+        try std.testing.expectEqual(@as(usize, "fx-image-snapshots-".len + 16), std.Io.Dir.path.basename(path).len);
+    }
+}
+
+test "image location notes quote the saved path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/Users/example/Shots/shot.png"),
+        .media_type = @constCast("image/jpeg"),
+        .snapshot_path = @constCast("/Users/example/fx \"home\"]\n/sessions/s/images/image-7-0123456789abcdef.bin"),
+    }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #7]", .images = &images }};
+    const projected = try noteAttachmentLocations(arena, &messages);
+    try std.testing.expectEqualStrings(
+        "[Image #7 (image/jpeg) is saved at \"/Users/example/fx \\\"home\\\"]\\n/sessions/s/images/image-7-0123456789abcdef.bin\".]\n[Image #7]",
+        projected[0].content.?,
+    );
+}
+
 test "requests leave out tool images the session dropped, with one note per result" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3644,6 +3826,29 @@ test "requests keep verified attachments within the pixel limit unchanged" {
     const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
 
     try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
+}
+
+test "a withheld prompt image's notice names the blob the note names (D89)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wide = image_data.testPngHeader(9000, 10);
+    var saved = try captureInlineImageBytesInMemory(arena, 1, "image/png", &wide);
+    saved.snapshot_path = @constCast("/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
+    saved.blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+    var cache: AttachmentDimensionCache = .empty;
+    const in_blob = [_]types.ChatMessage{.{ .role = .user, .content = "look", .images = &.{saved} }};
+    const named = try withholdOversizedAttachments(arena, arena, &cache, &in_blob, 8000);
+    try std.testing.expectEqual(@as(usize, 0), named.messages[0].images.len);
+    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.fx/sessions/v2/s/blobs/0123abcd. ") != null);
+    // Inline bytes without a blob have no saved file, and the temporary
+    // snapshot beside them is never named.
+    var unsaved = saved;
+    unsaved.blob_path = null;
+    const inline_only = [_]types.ChatMessage{.{ .role = .user, .content = "look", .images = &.{unsaved} }};
+    const unnamed = try withholdOversizedAttachments(arena, arena, &cache, &inline_only, 8000);
+    try std.testing.expect(std.mem.find(u8, unnamed.messages[0].content.?, "No local image file is available") != null);
+    try std.testing.expect(std.mem.find(u8, unnamed.messages[0].content.?, "fx-image-snapshots") == null);
 }
 
 test "reference-only attachments get host recovery guidance without attempting file access" {
@@ -4672,4 +4877,92 @@ test "inline snapshot verification rejects corrupted retained bytes" {
     var missing_digest = attachment;
     missing_digest.snapshot_sha256 = null;
     try std.testing.expectError(error.MissingImageSnapshot, loadVerifiedSnapshot(alloc, missing_digest, .{}));
+}
+
+test "a recalled image whose bytes are inline keeps them inline and writes no file (D84, D89)" {
+    const alloc = std.testing.allocator;
+    const png = image_data.testPngHeader(10, 10);
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", &png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    const recalled = try cloneVerifiedImageAttachment(alloc, attachment, 2);
+    defer discardImageAttachment(alloc, recalled);
+    try std.testing.expectEqual(@as(usize, 2), recalled.id);
+    try std.testing.expectEqualSlices(u8, &png, recalled.inline_data.?);
+    try std.testing.expect(recalled.inline_data.?.ptr != attachment.inline_data.?.ptr);
+    try std.testing.expectEqualStrings(attachment.snapshot_sha256.?, recalled.snapshot_sha256.?);
+    try std.testing.expectEqual(@as(?[]u8, null), recalled.snapshot_path);
+
+    // Bytes that no longer match their digest are refused, as a file is.
+    var corrupted = attachment;
+    corrupted.inline_data = try alloc.dupe(u8, attachment.inline_data.?);
+    defer alloc.free(corrupted.inline_data.?);
+    corrupted.inline_data.?[9] ^= 1;
+    try std.testing.expectError(error.ImageSnapshotCorrupt, cloneVerifiedImageAttachment(alloc, corrupted, 3));
+}
+
+test "an image saved as a blob is only its handle, and readers load the blob, even one a fork hard-linked (D89)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = image_data.testPngHeader(4, 3);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(&png, &digest, .{});
+    var hex = std.fmt.bytesToHex(digest, .lower);
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = &hex, .data = &png });
+    // A fork hard-links its source's blobs, so this one has two links.
+    try std.Io.Dir.hardLink(tmp.dir, &hex, tmp.dir, "forked", io_mod.getIo(), .{ .follow_symlinks = false });
+    const blob = try io_mod.dirRealpathAlloc(alloc, tmp.dir, &hex);
+    defer alloc.free(blob);
+    const handle: types.ImageAttachment = .{
+        .id = 1,
+        .path = @constCast("/Users/example/shot.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = &hex,
+        .blob_path = blob,
+    };
+    try std.testing.expect(!handle.droppedFromSession());
+    var read = try loadVerifiedSnapshot(alloc, handle, .{});
+    defer read.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &png, read.bytes);
+    try std.testing.expectEqual(@as(?usize, png.len), attachmentRawBytes(handle));
+    var cache_arena = std.heap.ArenaAllocator.init(alloc);
+    defer cache_arena.deinit();
+    var cache: AttachmentDimensionCache = .empty;
+    const dimensions = (try attachmentDimensions(cache_arena.allocator(), &cache, handle)).?;
+    try std.testing.expectEqual(@as(u32, 4), dimensions.width);
+
+    // A blob's folders may be reached through a symlink, as a home under
+    // macOS's /var is; a snapshot's may not.
+    try tmp.dir.symLink(io_mod.getIo(), ".", "linked", .{ .is_directory = true });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const through_link = try std.Io.Dir.path.join(alloc, &.{ root, "linked", &hex });
+    defer alloc.free(through_link);
+    var linked = handle;
+    linked.blob_path = through_link;
+    var linked_read = try loadVerifiedSnapshot(alloc, linked, .{});
+    defer linked_read.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &png, linked_read.bytes);
+    var linked_snapshot = handle;
+    linked_snapshot.blob_path = null;
+    linked_snapshot.snapshot_path = through_link;
+    try std.testing.expectError(error.ImageSnapshotPathUnsafe, loadVerifiedSnapshot(alloc, linked_snapshot, .{}));
+
+    // A recall carries the bytes inline and writes no file.
+    const recalled = try cloneVerifiedImageAttachment(alloc, handle, 2);
+    defer discardImageAttachment(alloc, recalled);
+    try std.testing.expectEqualSlices(u8, &png, recalled.inline_data.?);
+    try std.testing.expectEqual(@as(?[]u8, null), recalled.blob_path);
+
+    // Only a blob may have another link; a snapshot in the shared
+    // temporary folder may not.
+    var snapshot = handle;
+    snapshot.blob_path = null;
+    snapshot.snapshot_path = blob;
+    try std.testing.expectError(error.NotRegularFile, loadVerifiedSnapshot(alloc, snapshot, .{}));
+
+    // A damaged blob fails its digest wherever it is read.
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = &hex, .data = "damaged" });
+    try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, handle, .{}));
 }

@@ -324,7 +324,6 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
             if (call.provenance != .fx_local or call.provider_result != null) return error.UnsupportedToolProvenance;
             if (call.id.len == 0 or call.final_identity != .valid) return error.InvalidToolCallId;
             try validate_name(call.name);
-            if (call.argument_integrity != .valid) return error.InvalidToolArguments;
             if (call.arguments_json.len > max_history_arguments_bytes) return error.ArgumentsTooLarge;
             try validate_arguments(alloc, call.arguments_json);
             const entry = try pending.getOrPut(alloc, call.id);
@@ -978,10 +977,16 @@ pub const Reducer = struct {
         // model actually sent is never silently dropped.
         const terminal_reason: types.ProviderFinishReason = if (self.tools.items.len != 0) .tool_calls else .stop;
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        // Unadvertised names and invalid arguments are returned as sent. The tool
+        // loop decides whether such a call runs and answers the rest, and the
+        // permission reviewer retries a malformed decision.
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
-            _ = try receivedToolName(tool.name.items);
-            try validate_arguments(self.alloc, tool.arguments.items);
+            // Padding around a streamed name is trimmed before the wire check,
+            // so a padded name the model could hand back is still answered
+            // rather than closing the stream.
+            try validate_name(try receivedToolName(tool.name.items));
+            try check_json_depth(tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
@@ -1084,11 +1089,12 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// exactly at framed [DONE], without waiting for EOF or consuming another event.
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
-pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
+/// `progress`, when set, is told about each data event.
+pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
     defer reducer.deinit();
-    var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
+    var framing = sse.Reader{ .max_event_bytes = limits.event_bytes, .progress = progress };
     defer framing.deinit(alloc);
     while (true) {
         const remaining = limits.total_wire_bytes - framing.total_bytes;
@@ -1588,9 +1594,9 @@ test "chat completions reasoning presentation checks cancellation before content
         var source = std.Io.Reader.fixed(wire);
         const sink: stream_provider.EventSink = .{ .context = &observer, .emit_fn = Observer.emit };
         if (cancel) {
-            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag));
+            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null));
         } else {
-            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag);
+            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null);
             defer result.deinit(std.testing.allocator);
         }
         try std.testing.expectEqual(@as(usize, 1), observer.reasoning_count);
@@ -2333,20 +2339,51 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
 }
 
-test "chat completions malformed and nonobject final arguments never become tools" {
+test "chat completions returns unadvertised names and invalid arguments as sent" {
+    // The tool loop and the permission reviewer decide what happens to these
+    // calls, so the stream must not fail here.
     const alloc = std.testing.allocator;
-    for ([_][]const u8{ "", "{", "[]", "null", "3", "{}junk", "{\"x\":1,\"x\":2}" }) |arguments| {
+    const cases = [_]struct { name: []const u8, arguments: []const u8 }{
+        .{ .name = "not_advertised", .arguments = "{\"path\":\"a\"}" },
+        .{ .name = "read_file", .arguments = "" },
+        .{ .name = "read_file", .arguments = "{" },
+        .{ .name = "read_file", .arguments = "[]" },
+        .{ .name = "read_file", .arguments = "null" },
+        .{ .name = "read_file", .arguments = "3" },
+        .{ .name = "read_file", .arguments = "{}junk" },
+        .{ .name = "read_file", .arguments = "{\"x\":1,\"x\":2}" },
+    };
+    for (cases) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.writeAll("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":");
-        try std.json.Stringify.value(arguments, .{}, &out.writer);
+        try out.writer.writeAll("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":");
+        try std.json.Stringify.value(case.name, .{}, &out.writer);
+        try out.writer.writeAll(",\"arguments\":");
+        try std.json.Stringify.value(case.arguments, .{}, &out.writer);
         try out.writer.writeAll("}}]}}]}");
         try test_accept(&reducer, out.written());
-        try std.testing.expectError(error.InvalidToolArguments, test_finish(&reducer, test_tools_finish));
-        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
+        var result = try test_finish(&reducer, test_tools_finish);
+        defer result.deinit(alloc);
+        const call = result.completed.completion.tool_calls[0];
+        try std.testing.expectEqualStrings(case.name, call.name);
+        try std.testing.expectEqualStrings(case.arguments, call.arguments_json);
     }
+}
+
+test "chat completions history replays a call the tool loop blocked" {
+    // dupeBlockedToolCall keeps the rejected integrity and replays `{}`.
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}", .argument_integrity = .malformed_json }} },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "Tool arguments were not valid JSON." },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"arguments\":\"{}\"") != null);
 }
 
 test "chat completions terminal evidence and finish reasons are strict" {
@@ -2478,33 +2515,94 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         defer alloc.free(buffer);
         var fixed = std.Io.Reader.fixed(wire);
         var source = fixed.limited(.unlimited, buffer);
-        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled);
+        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, null);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
     for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
-        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
     }
     {
         var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n", 20));
-        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled));
+        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled, null));
     }
     {
         var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n\n", 20));
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled, null));
     }
     {
         var source = std.Io.Reader.fixed(wire);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled, null));
     }
     // A terminal delimiter is sufficient: never wait for a failing next read.
     var source = std.Io.Reader.failing;
     source.buffer = @constCast(wire);
     source.end = wire.len;
-    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
     defer result.deinit(alloc);
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning\":{f}}}}}]}}", piece);
+        }
+    }
+    for (try content.pieces(arena), 0..) |piece, index| {
+        if (index == 0) {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"resolved-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
+        } else {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
+        }
+    }
+    if (with_tool) {
+        for (try arguments.pieces(arena), 0..) |piece, index| {
+            if (index == 0) {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":{f}}}}}]}}}}]}}", piece);
+            } else {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{f}}}}}]}}}}]}}", piece);
+            }
+        }
+    }
+    try wire.print("data: {s}\n\ndata: [DONE]\n\n", .{if (with_tool) test_tools_finish else test_stop});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    const cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null);
+    defer result.deinit(std.testing.allocator);
+
+    if (result != .completed) return error.TestStreamFailed;
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
+}
+
+test "chat completions streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").chat_completions_stream.*),
+    });
 }
 
 test "chat completions reducer caps events content identities arguments tools and nesting" {
@@ -2539,7 +2637,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     var cancelled = std.atomic.Value(bool).init(true);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
     var request = test_request();
     request.budget = .{ .cancel_flag = &cancelled };
     const serialized = try build_request(alloc, request, .{});
@@ -2556,7 +2654,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     var observer = Observer{ .flag = &cancelled };
     cancelled.store(false, .seq_cst);
     source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled, null));
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
@@ -2569,7 +2667,7 @@ fn test_allocation_paths(alloc: Allocator) !void {
     defer alloc.free(body);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish ++ "\n\ndata: [DONE]\n\n");
     const cancelled = std.atomic.Value(bool).init(false);
-    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled, null);
     defer result.deinit(alloc);
 }
 
@@ -2647,7 +2745,7 @@ test "chat completions missing tool fields sparse indexes and invalid identities
     const cases = [_]struct { delta: []const u8, failure: Error, at_finish: bool = false }{
         .{ .delta = "{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
-        .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read_file\"}}", .failure = error.InvalidToolArguments, .at_finish = true },
+        .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"type\":\"invalid\"}", .failure = error.InvalidChunk },
@@ -2671,7 +2769,10 @@ test "chat completions missing tool fields sparse indexes and invalid identities
 
 test "chat completions repeated consistent identity preserves one call" {
     const alloc = std.testing.allocator;
-    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    var request = test_request();
+    const function: model_tool_schema.FunctionSchema = .{ .name = "read_file", .description = "Read." };
+    request.tools.additional_functions = &.{function};
+    var reducer = try Reducer.init(alloc, request, .{});
     defer reducer.deinit();
     try test_accept(&reducer, test_call);
     try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"arguments\":\"\"}}]}}]}");
@@ -2769,7 +2870,7 @@ test "chat completions exact wire and aggregate delta bounds include the termina
     const wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n";
     const cancelled = std.atomic.Value(bool).init(false);
     var source = std.Io.Reader.fixed(wire);
-    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled, null);
     defer result.deinit(alloc);
     for ([_]struct { limits: Limits, failure: Error }{
         .{ .limits = .{ .total_wire_bytes = test_text.len }, .failure = error.StreamTooLarge },

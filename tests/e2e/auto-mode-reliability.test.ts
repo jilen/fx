@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { logLines, rootSessionIds } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -242,9 +242,8 @@ describe("lean auto mode reliability", () => {
       expect(laterReview).not.toContain(accusation);
       expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
       const sessionId = JSON.parse(result.stdout).session_id;
-      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      const held = (logLines(root.home, sessionId) as any[])
+        .find((line) => line.kind === "item" && line.type === "tool_result" && line.data?.call_id === "edit_plan").data;
       expect(held.review_feedback).toBe(true);
       const resumed = await runFx(
         ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
@@ -473,6 +472,49 @@ describe("lean auto mode reliability", () => {
       expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(result.stdout).toContain("static command complete");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "routine commands with zsh extended glob words remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // With zsh's `extendedglob`, `^x` matches every file not named `x`
+          // and `x#` matches any run of `x`.
+          cleanCommandCall("npm test ^nomatch", "caret_glob"),
+          cleanCommandCall("npm install react@^18", "caret_in_word"),
+          cleanCommandCall("npm test x#", "hash_glob"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("glob words stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "caret_glob_review"),
+          fakeGatewayPermissionDecision("caution", "caret_in_word_review"),
+          fakeGatewayPermissionDecision("caution", "hash_glob_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
   );
@@ -1094,6 +1136,92 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "routine commands with words the shell reads differently remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // The shell passes a quoted or escaped `&&` to `npm test`, with
+          // `--global`.
+          cleanCommandCall("npm test '&&' npm run build --global", "quoted_separator"),
+          cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
+          // Every shell drops `#note` as a comment.
+          cleanCommandCall("npm test #note", "comment_word"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("shell syntax stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
+          fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
+          fakeGatewayPermissionDecision("caution", "comment_word_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git fetch with an option that names a program remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "upload-pack-must-not-run");
+      const bin = installRecorder(root, "upload-pack-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs the `--upload-pack` command to fetch from `.`.
+          cleanCommandCall("git fetch --upload-pack=upload-pack-probe .", "upload_pack"),
+          // git accepts any unambiguous prefix of a long option.
+          cleanCommandCall("git fetch --upl=upload-pack-probe .", "abbreviated_upload_pack"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("fetch options stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "upload_pack_review"),
+          fakeGatewayPermissionDecision("caution", "abbreviated_upload_pack_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();
@@ -1423,14 +1551,7 @@ describe("lean auto mode reliability", () => {
         timeoutMs: TIMEOUT,
       });
       expect(first.code).toBe(0);
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(join(root.home, ".fx", "sessions", entry.name, "session.json"))
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const sessionId = sessionIds[0]!;
 
@@ -2188,16 +2309,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.kill();
       activeSession = null;
 
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(
-            join(root.home, ".fx", "sessions", entry.name, "session.json"),
-          )
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const result = await runFx(
         [

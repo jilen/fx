@@ -312,7 +312,6 @@ pub const DispatchContext = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
-    mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
@@ -417,7 +416,6 @@ pub const ExecutorKind = enum {
     subagent,
     capability_search,
     mcp_select_tool,
-    mcp_features,
     ask_user_question,
     vision,
     host,
@@ -437,6 +435,9 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+/// Names the action a model call without one means, or null when it is not
+/// exactly one. See `Tool.infer_action_fn`.
+pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
@@ -492,6 +493,10 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
+    /// The orchestrator adds the inferred action to a model call that leaves
+    /// it out before the call is stored or admitted, so admission and decode
+    /// read the same arguments.
+    infer_action_fn: ?InferActionFn = null,
     process_local_fn: ?ProcessLocalFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,

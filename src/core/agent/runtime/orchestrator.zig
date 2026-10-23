@@ -54,6 +54,7 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_route = @import("../../images/image_route.zig");
 const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
@@ -263,6 +264,26 @@ fn append_immediate_steering_after_cancel(
     return true;
 }
 
+/// Continues the turn with steering that waited out a Stop hook which allowed
+/// the reply, such as steering submitted while a provider-executed tool's
+/// step still counted as running. The reply stays in the turn, and the next
+/// one runs the hook again, as after steering that cancelled the hook.
+fn continue_steering_after_stop(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    origin: runtime_config.TurnOrigin,
+    stop_state: *CommonStopState,
+) !bool {
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    if (action != .continued) return false;
+    stop_state.retained_candidate = null;
+    stop_state.latest_partial = null;
+    stop_state.dispatched = false;
+    return true;
+}
+
 fn reset_recovery_after_immediate_steering(
     latest_diagnostic: *?types.ModelFailureDiagnostic,
     strategy: *?model_response_recovery.Strategy,
@@ -277,60 +298,12 @@ fn reset_recovery_after_immediate_steering(
     tool_evidence.* = .none;
 }
 
-fn request_union_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-    tool_name: []const u8,
-) bool {
-    for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, tool_name)) continue;
-        return model_tool_schema.isSingleRequiredObjectUnionField(
-            function.input_schema,
-            "request",
-        );
-    }
-    return false;
-}
-
-fn subagent_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) continue;
-        return model_tool_schema.isSingleRequiredObjectUnionField(
-            function.input_schema,
-            "request",
-        );
-    }
-    return false;
-}
-
-fn terminal_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    return request_union_schema_advertised(advertised_functions, "shell");
-}
-
-fn read_tool_result_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    return request_union_schema_advertised(
-        advertised_functions,
-        "read_tool_result",
-    );
-}
-
-fn terminal_request_normalization_eligible(
-    base_nested_terminal_advertised: bool,
-    vision_mode: runtime_gateway_step.VisionToolMode,
-) bool {
-    return base_nested_terminal_advertised and vision_mode != .required;
-}
-
-fn subagent_request_normalization_eligible(
-    base_nested_subagent_advertised: bool,
-    vision_mode: runtime_gateway_step.VisionToolMode,
-) bool {
-    return base_nested_subagent_advertised and vision_mode != .required;
+/// shell, subagent, and read_tool_result are advertised with top-level
+/// arguments. Every step except a required vision call, which offers no other
+/// tool, unwraps an exact {"request":{...}} a model sends out of habit and
+/// replays stored wrapped calls with top-level arguments.
+fn request_unwrap_eligible(vision_mode: runtime_gateway_step.VisionToolMode) bool {
+    return vision_mode != .required;
 }
 
 fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
@@ -365,40 +338,11 @@ const terminal_model_payload_mappings = [_]TerminalModelPayloadMapping{
     .{ .kind = "paste", .model_field = "paste", .internal_field = "text" },
 };
 
-fn terminal_payload_mapping(
-    wanted: []const u8,
-    comptime field: enum { kind, model },
-) ?TerminalModelPayloadMapping {
+fn terminal_payload_mapping(model_field: []const u8) ?TerminalModelPayloadMapping {
     for (terminal_model_payload_mappings) |mapping| {
-        const candidate = switch (field) {
-            .kind => mapping.kind,
-            .model => mapping.model_field,
-        };
-        if (std.mem.eql(u8, candidate, wanted)) return mapping;
+        if (std.mem.eql(u8, mapping.model_field, model_field)) return mapping;
     }
     return null;
-}
-
-fn project_terminal_model_write(
-    arena: Allocator,
-    object: *std.json.ObjectMap,
-) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write")) return false;
-    elide_terminal_null_lease(object);
-    if (object.get("lease") != null or object.get("input") != null) {
-        return false;
-    }
-    const write = object.get("write") orelse return false;
-    if (write != .object) return false;
-    const kind = write.object.get("kind") orelse return false;
-    if (kind != .string) return false;
-    const mapping = terminal_payload_mapping(kind.string, .kind) orelse return false;
-    const payload = write.object.get(mapping.internal_field) orelse return false;
-    var input = std.json.Value{ .object = .empty };
-    try input.object.put(arena, mapping.model_field, payload);
-    try object.put(arena, "input", input);
-    _ = object.orderedRemove("write");
-    return true;
 }
 
 fn normalize_terminal_model_input(
@@ -414,7 +358,7 @@ fn normalize_terminal_model_input(
     if (input != .object or input.object.count() != 1) return false;
     const input_key = input.object.keys()[0];
     const input_value = input.object.values()[0];
-    const mapping = terminal_payload_mapping(input_key, .model) orelse return false;
+    const mapping = terminal_payload_mapping(input_key) orelse return false;
     var write = std.json.Value{ .object = .empty };
     try write.object.put(arena, "kind", .{ .string = mapping.kind });
     try write.object.put(arena, mapping.internal_field, input_value);
@@ -423,39 +367,8 @@ fn normalize_terminal_model_input(
     return true;
 }
 
-fn projected_terminal_request_arguments(
-    alloc: Allocator,
-    arguments_json: []const u8,
-) Allocator.Error!?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
-    if (parsed.value.object.count() == 1) {
-        if (parsed.value.object.getPtr("request")) |request| {
-            if (request.* == .object) {
-                if (!try project_terminal_model_write(arena, &request.object)) {
-                    return null;
-                }
-                var wrapped_out: std.Io.Writer.Allocating = .init(alloc);
-                defer wrapped_out.deinit();
-                std.json.Stringify.value(parsed.value, .{}, &wrapped_out.writer) catch
-                    return error.OutOfMemory;
-                return try wrapped_out.toOwnedSlice();
-            }
-        }
-    }
-    _ = try project_terminal_model_write(arena, &parsed.value.object);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch return error.OutOfMemory;
-    return try out.toOwnedSlice();
-}
-
+/// Returns the top-level arguments of an exact {"request":{...}}
+/// read_tool_result call, or null to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -470,16 +383,13 @@ fn projected_read_tool_result_arguments(
         else => null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    if (parsed.value.object.count() == 1 and
-        parsed.value.object.get("request") != null)
-    {
-        return null;
-    }
+    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    const request = parsed.value.object.get("request") orelse return null;
+    if (request != .object) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+    std.json.Stringify.value(request, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -568,18 +478,18 @@ fn projectLegacyTerminalExecArguments(
     if (action != .string or !std.mem.eql(u8, action.string, "exec")) return null;
     const command = parsed.value.object.get("command") orelse return null;
     if (command != .string) return null;
-    var request = std.json.Value{ .object = .empty };
-    defer request.object.deinit(alloc);
-    try request.object.put(alloc, "action", .{ .string = "run" });
-    try request.object.put(alloc, "command", command);
+    var run = std.json.Value{ .object = .empty };
+    defer run.object.deinit(alloc);
+    try run.object.put(alloc, "action", .{ .string = "run" });
+    try run.object.put(alloc, "command", command);
     for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
         if (parsed.value.object.get(name)) |value| {
-            try request.object.put(alloc, name, value);
+            try run.object.put(alloc, name, value);
         }
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
+    std.json.Stringify.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -587,13 +497,9 @@ fn projectLegacyTerminalExecArguments(
 test "legacy exec argument projection releases temporary allocations" {
     const Probe = struct {
         fn run(alloc: Allocator) !void {
-            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\"}") orelse return error.TestUnexpectedResult;
+            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\",\"cwd\":\"src\"}") orelse return error.TestUnexpectedResult;
             defer alloc.free(projected);
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
-            defer parsed.deinit();
-            const request = parsed.value.object.get("request") orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("run", request.object.get("action").?.string);
-            try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
+            try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\":\",\"cwd\":\"src\"}", projected);
         }
     };
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
@@ -733,13 +639,6 @@ fn project_terminal_request_messages(
                     .mapped = mapped_arguments != null,
                 });
                 needs_projection = true;
-                continue;
-            }
-            const tool = registry.lookup(call.name) orelse continue;
-            if (tool.executor_kind != .terminal) continue;
-            if (try projected_terminal_request_arguments(alloc, call.arguments_json)) |arguments| {
-                alloc.free(arguments);
-                needs_projection = true;
             }
         }
     }
@@ -818,18 +717,7 @@ fn project_terminal_request_messages(
                     };
                     continue;
                 }
-                const registered_terminal = if (registry.lookup(call.name)) |tool|
-                    tool.executor_kind == .terminal
-                else
-                    false;
-                const arguments = if (call.argument_integrity == .valid and
-                    registered_terminal)
-                    (try projected_terminal_request_arguments(
-                        alloc,
-                        call.arguments_json,
-                    )) orelse try alloc.dupe(u8, call.arguments_json)
-                else
-                    try alloc.dupe(u8, call.arguments_json);
+                const arguments = try alloc.dupe(u8, call.arguments_json);
                 var copied = call;
                 copied.arguments_json = arguments;
                 calls.append(alloc, copied) catch |err| {
@@ -1211,7 +1099,9 @@ test "subagent history makes every removed manager action inert" {
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
-    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[0].arguments_json);
+    // A stored wrapped call replays with the top-level arguments the schema
+    // now advertises.
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"current\"}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
     try std.testing.expectEqualStrings("current-run", projected[1].tool_call_id.?);
     try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
@@ -1328,6 +1218,12 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+/// Returns the arguments a terminal call is stored and admitted with: a
+/// `request` value unwrapped whether it arrived as an object or a string, outer
+/// fields adopted, and a missing action filled in when `infer_action` names
+/// exactly one. A call that needs no repair is left exactly as sent, so null
+/// means the arguments already read as they arrived.
+///
 /// Terminal tool arguments arrive in shapes the advertised schema does not
 /// allow: the request serialized to a string, action fields beside request, a
 /// missing action, and integers sent as text. Every repair below only moves or
@@ -1339,6 +1235,7 @@ fn project_read_tool_result_request_messages(
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    infer_action: ?tool_dispatch.InferActionFn,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1348,27 +1245,43 @@ fn normalized_terminal_request_arguments(
     if (parsed.value != .object) return null;
     const arena = parsed.arena.allocator();
 
+    var changed = false;
     var object: std.json.ObjectMap = blk: {
         if (parsed.value.object.count() == 1) {
             const wrapper = parsed.value.object.getPtr("request") orelse break :blk parsed.value.object;
             const value = try decodeTerminalRequestValue(arena, wrapper.*) orelse return null;
             if (value != .object) return null;
+            changed = true;
             break :blk value.object;
         }
         const wrapper = parsed.value.object.get("request") orelse break :blk parsed.value.object;
         const value = try decodeTerminalRequestValue(arena, wrapper) orelse return null;
         if (value != .object) return null;
+        changed = true;
         break :blk try mergeOuterTerminalFields(arena, value.object, parsed.value.object) orelse return null;
     };
 
-    // A flat call that states a command and nothing that names another action
-    // means run; the action field is the only thing added.
+    // A call that leaves out its action keeps the action the registered tool
+    // names for exactly these fields. The action comes first, as in a call that
+    // states it. A field shape the tool cannot name one action for is left as
+    // it arrived, so shell decode still reports the defect.
     if (object.get("action") == null) {
-        if (!statesRunAction(object)) return null;
-        try object.put(arena, "action", .{ .string = "run" });
+        if (infer_action) |infer| {
+            if (infer(object)) |action| {
+                var with_action: std.json.ObjectMap = .empty;
+                try with_action.put(arena, "action", .{ .string = action });
+                var fields = object.iterator();
+                while (fields.next()) |entry| {
+                    try with_action.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+                }
+                object = with_action;
+                changed = true;
+            }
+        }
     }
-    coerceTerminalIntegerText(&object);
-    _ = try normalize_terminal_model_input(arena, &object);
+    changed = coerceTerminalIntegerText(&object) or changed;
+    changed = (try normalize_terminal_model_input(arena, &object)) or changed;
+    if (!changed) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1404,27 +1317,19 @@ fn mergeOuterTerminalFields(
     return merged;
 }
 
-/// Reports whether a flat argument object states a command and nothing that
-/// belongs to another action.
-fn statesRunAction(object: std.json.ObjectMap) bool {
-    const command = object.get("command") orelse return false;
-    if (command != .string or command.string.len == 0) return false;
-    for ([_][]const u8{ "session_id", "chars", "force" }) |name| {
-        if (object.contains(name)) return false;
-    }
-    return true;
-}
-
 /// Reads the integer fields a model sent as text. A value that does not parse
 /// is left alone, so shell decode still reports the type problem.
-fn coerceTerminalIntegerText(object: *std.json.ObjectMap) void {
+fn coerceTerminalIntegerText(object: *std.json.ObjectMap) bool {
+    var changed = false;
     for ([_][]const u8{ "timeout_ms", "yield_time_ms" }) |name| {
         const value = object.getPtr(name) orelse continue;
         if (value.* != .string) continue;
         const number = std.fmt.parseInt(u64, std.mem.trim(u8, value.string, " \t\r\n"), 10) catch continue;
         if (number > std.math.maxInt(u32)) continue;
         value.* = .{ .integer = @intCast(number) };
+        changed = true;
     }
+    return changed;
 }
 
 fn managed_subagent_action(action: []const u8) ?[]const u8 {
@@ -1434,6 +1339,8 @@ fn managed_subagent_action(action: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Returns the top-level arguments of an exact {"request":{...}} subagent call
+/// whose action is run or message, or null to keep the call as it was sent.
 fn normalized_subagent_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1443,31 +1350,15 @@ fn normalized_subagent_request_arguments(
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
+    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    const request = parsed.value.object.get("request") orelse return null;
+    if (request != .object) return null;
+    const action = request.object.get("action") orelse return null;
+    if (action != .string or managed_subagent_action(action.string) == null) return null;
 
-    if (parsed.value.object.getPtr("request")) |request| {
-        if (parsed.value.object.count() != 1 or request.* != .object) return null;
-        const action = request.object.getPtr("action") orelse return null;
-        if (action.* != .string) return null;
-        const canonical = managed_subagent_action(action.string) orelse return null;
-        if (std.mem.eql(u8, canonical, action.string)) return null;
-        action.* = .{ .string = canonical };
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        std.json.Stringify.value(parsed.value, .{}, &out.writer) catch return error.OutOfMemory;
-        return try out.toOwnedSlice();
-    }
-
-    const action = parsed.value.object.getPtr("action") orelse return null;
-    if (action.* != .string) return null;
-    const canonical = managed_subagent_action(action.string) orelse return null;
-    action.* = .{ .string = canonical };
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
-        return error.OutOfMemory;
-    _ = arena;
+    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1557,6 +1448,7 @@ fn normalize_terminal_request_tool_calls(
         const arguments_json = try normalized_terminal_request_arguments(
             alloc,
             call.arguments_json,
+            tool.infer_action_fn,
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1606,43 +1498,30 @@ fn normalize_subagent_request_tool_calls(
     return normalized orelse source;
 }
 
-test "subagent request normalization follows effective attempt advertisement" {
+test "subagent intake unwraps an exact request wrapper" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const nested = tool_dispatch.Tool{
+    const tool = tool_dispatch.Tool{
         .name = "subagent",
         .description = "subagent",
-        .model_schema = .{
-            .name = "subagent",
-            .description = "subagent",
-            .input_schema = .{
-                .properties = &.{.{
-                    .name = "request",
-                    .json_type = .object,
-                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
-                }},
-                .required = &.{"request"},
-                .additional_properties = false,
-            },
-        },
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
         .executor_kind = .subagent,
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    const registry = tool_dispatch.Registry{ .tools = &.{nested} };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
     const calls = [_]ToolCall{
         .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
         .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
-        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"canonical\"}}" },
+        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
+        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
+        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
     };
 
-    try std.testing.expect(subagent_request_schema_advertised(&.{nested.model_schema}));
-    try std.testing.expect(subagent_request_normalization_eligible(true, .optional));
-    try std.testing.expect(!subagent_request_normalization_eligible(true, .required));
     const normalized = try normalize_subagent_request_tool_calls(
         arena,
         registry,
@@ -1650,16 +1529,17 @@ test "subagent request normalization follows effective attempt advertisement" {
         &calls,
     );
     try std.testing.expect(normalized.ptr != calls[0..].ptr);
+    try std.testing.expectEqual(calls[0].arguments_json.ptr, normalized[0].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"run\",\"task\":\"review\"}}",
-        normalized[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        calls[1].arguments_json,
+        "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}",
         normalized[1].arguments_json,
     );
-    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
-    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
+    // Anything but an exact wrapper around a known action reaches the decoder
+    // as sent, which names what is wrong with it.
+    for (calls[3..], normalized[3..]) |call, result| {
+        try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
+    }
     const ineligible = try normalize_subagent_request_tool_calls(
         arena,
         registry,
@@ -1669,48 +1549,13 @@ test "subagent request normalization follows effective attempt advertisement" {
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
-test "shell request normalization follows effective attempt advertisement" {
-    const nested = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{
-            .name = "shell",
-            .description = "shell",
-            .input_schema = .{
-                .properties = &.{.{
-                    .name = "request",
-                    .json_type = .object,
-                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
-                }},
-                .required = &.{"request"},
-                .additional_properties = false,
-            },
-        },
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const flat = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-
-    try std.testing.expect(terminal_request_schema_advertised(&.{nested.model_schema}));
-    try std.testing.expect(!terminal_request_schema_advertised(&.{flat.model_schema}));
-    try std.testing.expect(!terminal_request_schema_advertised(&.{}));
-    try std.testing.expect(terminal_request_normalization_eligible(true, .unavailable));
-    try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
-    try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
-    try std.testing.expect(!terminal_request_normalization_eligible(false, .unavailable));
+test "request unwrapping skips only required vision calls" {
+    try std.testing.expect(request_unwrap_eligible(.unavailable));
+    try std.testing.expect(request_unwrap_eligible(.optional));
+    try std.testing.expect(!request_unwrap_eligible(.required));
 }
 
-test "terminal inferred model input round trips every atomic write payload" {
+test "terminal model write input normalizes every atomic payload" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         internal: []const u8,
@@ -1734,22 +1579,17 @@ test "terminal inferred model input round trips every atomic write payload" {
         },
     };
     for (cases) |case| {
-        const projected = (try projected_terminal_request_arguments(
-            alloc,
-            case.internal,
-        )).?;
-        defer alloc.free(projected);
-        try std.testing.expectEqualStrings(case.model, projected);
         const normalized = (try normalized_terminal_request_arguments(
             alloc,
-            projected,
+            case.model,
+            null,
         )).?;
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
     }
 }
 
-test "shell request projection wraps eligible flat objects without changing source messages" {
+test "shell history replays stored calls as sent" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1764,42 +1604,22 @@ test "shell request projection wraps eligible flat objects without changing sour
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    var browser_terminal = terminal_tool;
-    browser_terminal.name = "browser_terminal";
-    browser_terminal.executor_kind = .run_command;
-    const tools = [_]tool_dispatch.Tool{ terminal_tool, browser_terminal };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-
-    const cases = [_]struct {
-        id: []const u8,
-        input: []const u8,
-        expected: []const u8,
-    }{
-        .{ .id = "missing-action", .input = "{}", .expected = "{\"request\":{}}" },
-        .{ .id = "null-action", .input = "{\"action\":null}", .expected = "{\"request\":{\"action\":null}}" },
-        .{ .id = "non-string-action", .input = "{\"action\":7}", .expected = "{\"request\":{\"action\":7}}" },
-        .{ .id = "unknown-action", .input = "{\"action\":\"unknown\"}", .expected = "{\"request\":{\"action\":\"unknown\"}}" },
-        .{ .id = "valid-action", .input = "{\"action\":\"list\"}", .expected = "{\"request\":{\"action\":\"list\"}}" },
-        .{ .id = "atomic-keys", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "textual-null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "explicit-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}}" },
-        .{ .id = "null-request", .input = "{\"request\":null}", .expected = "{\"request\":{\"request\":null}}" },
-        .{ .id = "request-sibling", .input = "{\"request\":{\"action\":\"list\"},\"sibling\":true}", .expected = "{\"request\":{\"request\":{\"action\":\"list\"},\"sibling\":true}}" },
-        .{ .id = "exact-wrapper", .input = "{\"request\":{\"action\":\"list\"}}", .expected = "{\"request\":{\"action\":\"list\"}}" },
-        .{ .id = "non-object", .input = "[]", .expected = "[]" },
+    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
+    // Accepted calls are stored flat; rejected calls keep the bytes the model
+    // sent. Neither gains a request wrapper on the way back to the model
+    // (`tests/tla/shell_command/ShellContract.tla` HistoryFidelity).
+    const calls = [_]ToolCall{
+        .{ .id = "accepted", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .id = "rejected", .name = "shell", .arguments_json = "{\"action\":\"unknown\"}" },
+        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\"},\"sibling\":true}" },
+        .{ .id = "malformed", .name = "shell", .arguments_json = "{}", .argument_integrity = .malformed_json },
     };
-    var calls: [cases.len + 3]ToolCall = undefined;
-    for (cases, 0..) |case, index| {
-        calls[index] = .{ .id = case.id, .name = "shell", .arguments_json = case.input };
-    }
-    calls[cases.len] = .{ .id = "malformed", .name = "shell", .arguments_json = "{", .argument_integrity = .malformed_json };
-    calls[cases.len + 1] = .{ .id = "unknown-tool", .name = "missing", .arguments_json = "{}" };
-    calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
-        .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
-        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[]" } },
-        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
+        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls },
+        .{ .role = .tool, .content = "accepted result", .tool_call_id = "accepted", .tool_name = "shell" },
+        .{ .role = .tool, .content = "rejected result", .tool_call_id = "rejected", .tool_name = "shell" },
+        .{ .role = .tool, .content = "wrapped result", .tool_call_id = "wrapped", .tool_name = "shell" },
+        .{ .role = .tool, .content = "malformed result", .tool_call_id = "malformed", .tool_name = "shell" },
     };
 
     const projected = try project_terminal_request_messages(
@@ -1810,47 +1630,18 @@ test "shell request projection wraps eligible flat objects without changing sour
         agent_stream_provider.unavailable_provider,
         .{ .provider = .gateway, .model = "test" },
     );
-    try std.testing.expect(projected.ptr != messages[0..].ptr);
-    try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
-    try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
-    try std.testing.expectEqualStrings("assistant", projected[1].content.?);
-    try std.testing.expectEqualStrings("[]", projected[1].provider_replay.?.parts_json);
-    try std.testing.expectEqualStrings("keep result", projected[2].content.?);
-    for (cases, 0..) |case, index| {
-        try std.testing.expectEqualStrings(case.expected, projected[1].tool_calls[index].arguments_json);
-        try std.testing.expectEqualStrings(case.input, messages[1].tool_calls[index].arguments_json);
-    }
-    try std.testing.expectEqualStrings("{", projected[1].tool_calls[cases.len].arguments_json);
-    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 1].arguments_json);
-    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 2].arguments_json);
-
-    const idempotent = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        projected,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-    const ineligible = try project_terminal_request_messages(
-        arena,
-        registry,
-        false,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+    try std.testing.expectEqual(messages[0..].ptr, projected.ptr);
 }
 
-test "legacy read_tool_result history gains one nested request wrapper" {
+test "wrapped read_tool_result history replays with top-level arguments" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const calls = [_]ToolCall{
-        .{ .id = "legacy", .name = "read_tool_result", .arguments_json = "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}" },
+        .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
         .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
+        .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
+        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"{}\"}" },
     };
     const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
 
@@ -1860,17 +1651,17 @@ test "legacy read_tool_result history gains one nested request wrapper" {
         &messages,
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqual(calls[0].arguments_json.ptr, projected[0].tool_calls[0].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}}",
-        projected[0].tool_calls[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        calls[1].arguments_json,
+        "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
         projected[0].tool_calls[1].arguments_json,
     );
+    // Only an exact wrapper around an object is unwrapped.
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}",
-        messages[0].tool_calls[0].arguments_json,
+        "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
+        messages[0].tool_calls[1].arguments_json,
     );
 
     const idempotent = try project_read_tool_result_request_messages(
@@ -2305,12 +2096,11 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const tools = [_]tool_dispatch.Tool{terminal_tool};
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const first_calls = [_]ToolCall{
-        .{ .id = "one", .name = "shell", .arguments_json = "{}" },
-        .{ .id = "two", .name = "shell", .arguments_json = "{\"action\":null}" },
-        .{ .id = "atomic", .name = "shell", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
+        .{ .id = "legacy", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}" },
+        .{ .id = "current", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" },
     };
     const second_calls = [_]ToolCall{
-        .{ .id = "three", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "legacy-cwd", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\"src\"}" },
     };
     const source = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = &first_calls },
@@ -2326,13 +2116,10 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     );
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &source, projected);
-    try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}",
-        projected[0].tool_calls[2].arguments_json,
-    );
-    try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", projected[1].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("shell", projected[0].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings(first_calls[1].arguments_json, projected[0].tool_calls[1].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", projected[1].tool_calls[0].arguments_json);
 }
 
 test "terminal request projection cleans every partial allocation failure" {
@@ -2345,7 +2132,7 @@ test "terminal request projection cleans every partial allocation failure" {
 
 test "terminal request normalization accepts object JSON strings" {
     const alloc = std.testing.allocator;
-    const normalized = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\"}\"}")).?;
+    const normalized = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"pwd\\\"}\"}", testInferRunAction)).?;
     defer alloc.free(normalized);
     try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"pwd\"}", normalized);
     for ([_][]const u8{
@@ -2353,14 +2140,14 @@ test "terminal request normalization accepts object JSON strings" {
         "{\"request\":\"[]\"}",
         "{\"request\":\"{\\\"command\\\":\\\"pwd\\\",\\\"command\\\":\\\"true\\\"}\"}",
     }) |args| {
-        try std.testing.expectEqual(@as(?[]u8, null), try normalized_terminal_request_arguments(alloc, args));
+        try std.testing.expectEqual(@as(?[]u8, null), try normalized_terminal_request_arguments(alloc, args, null));
     }
 
     // An empty request beside a stated command adopts the command and reads as
     // a run, because nothing the model stated is overwritten.
-    const adopted = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{}\",\"command\":\"pwd\"}")).?;
+    const adopted = (try normalized_terminal_request_arguments(alloc, "{\"request\":\"{}\",\"command\":\"pwd\"}", testInferRunAction)).?;
     defer alloc.free(adopted);
-    try std.testing.expectEqualStrings("{\"command\":\"pwd\",\"action\":\"run\"}", adopted);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"pwd\"}", adopted);
 }
 
 test "terminal request normalization unwraps only exact eligible native calls" {
@@ -2512,6 +2299,7 @@ test "terminal request normalization repairs the shapes models actually send" {
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
+        .infer_action_fn = testInferRunAction,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
@@ -2536,8 +2324,9 @@ test "terminal request normalization repairs the shapes models actually send" {
             .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\",\"timeout_ms\":\"60000\"}}",
             .expected = "{\"action\":\"run\",\"command\":\"pwd\",\"timeout_ms\":60000}",
         },
-        // A flat command with no action means run.
-        .{ .args = "{\"command\":\"pwd\"}", .expected = "{\"command\":\"pwd\",\"action\":\"run\"}" },
+        // A flat command with no action means run, and the inferred action
+        // comes first, as in a call that states it.
+        .{ .args = "{\"command\":\"pwd\"}", .expected = "{\"action\":\"run\",\"command\":\"pwd\"}" },
         // A field the request already states is a collision, not a repair.
         .{ .args = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"},\"command\":\"false\"}", .expected = null },
         // A session action never gains an inferred action.
@@ -2566,6 +2355,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
+        .infer_action_fn = testInferRunAction,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
@@ -2575,6 +2365,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         .{ .id = "one", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"}}" },
         .{ .id = "two", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"start\"}}" },
         .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}" },
+        .{ .id = "inferred", .name = "terminal", .arguments_json = "{\"command\":\"true\",\"cwd\":\"src\"}" },
     };
     const normalized = try normalize_terminal_request_tool_calls(alloc, registry, true, &source);
     if (normalized.ptr == source[0..].ptr) return error.TestUnexpectedResult;
@@ -2598,6 +2389,69 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
         normalized[2].arguments_json,
     );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"run\",\"command\":\"true\",\"cwd\":\"src\"}",
+        normalized[3].arguments_json,
+    );
+}
+
+/// Stands in for shell's inferAction: a call with a command and no action
+/// means run.
+fn testInferRunAction(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("action") != null or object.get("command") == null) return null;
+    return "run";
+}
+
+test "terminal intake adds the action a call leaves out before it is stored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .infer_action_fn = testInferRunAction,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var without_inference = shell_tool;
+    without_inference.infer_action_fn = null;
+    const calls = [_]ToolCall{
+        .{ .id = "inferred", .name = "shell", .arguments_json = "{\"command\":\"ls\",\"cwd\":\"src\"}" },
+        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"command\":\"ls\"}}" },
+        .{ .id = "explicit", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}" },
+        .{ .id = "unnamed", .name = "shell", .arguments_json = "{\"session_id\":\"shell-1\"}" },
+    };
+
+    const normalized = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{shell_tool} },
+        true,
+        &calls,
+    );
+    // The action comes first, as in a call that names it.
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", normalized[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\"}", normalized[1].arguments_json);
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+
+    const plain = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{without_inference} },
+        true,
+        calls[0..1],
+    );
+    try std.testing.expectEqual(calls[0..1].ptr, plain.ptr);
+    const ineligible = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{shell_tool} },
+        false,
+        &calls,
+    );
+    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
 test "terminal request normalization cleans every partial allocation failure" {
@@ -3618,9 +3472,10 @@ fn streamReplaySafe(
 }
 
 /// Whether the current attempt has shown no output. A provider refuses a
-/// request for its size before any output, so a reply an earlier attempt
-/// streamed, such as one restored when a turn resumes, does not make sending
-/// it again with fewer images unsafe.
+/// request for its size or its context before any output, so a reply an
+/// earlier attempt streamed, such as one restarted or restored when a turn
+/// resumes, does not make sending it again with fewer images or a compacted
+/// conversation unsafe.
 fn attemptReplaySafe(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) bool {
@@ -5870,17 +5725,6 @@ fn processQueuedPromptInner(
         }
     }
 
-    const base_nested_terminal_advertised = terminal_request_schema_advertised(
-        config.advertised_functions,
-    );
-    const base_nested_subagent_advertised = subagent_request_schema_advertised(
-        config.advertised_functions,
-    );
-    const base_nested_read_tool_result_advertised =
-        read_tool_result_request_schema_advertised(
-            config.advertised_functions,
-        );
-
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     defer stable_prefix.deinit(arena);
 
@@ -6099,6 +5943,19 @@ fn processQueuedPromptInner(
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
     }
 
+    // The turn's images are saved before any request is built, so a note
+    // never names a file the session failed to write (D89,
+    // `tests/tla/session_manager/PromptImages.tla` NoteNamesBlob). The copy
+    // borrows the worker's fields; only what the save sets lives in this
+    // arena, and a saved image keeps only its handle.
+    if (deps.save_prompt_images) |save| {
+        if (job.images.len > 0) {
+            const images = try arena.dupe(types.ImageAttachment, job.images);
+            try save(deps.ctx, arena, images);
+            job.images = images;
+        }
+    }
+
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
@@ -6117,9 +5974,6 @@ fn processQueuedPromptInner(
         prepared_job,
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
-        base_nested_terminal_advertised,
-        base_nested_subagent_advertised,
-        base_nested_read_tool_result_advertised,
         finalization,
         arena,
         turn_id,
@@ -6335,98 +6189,42 @@ fn buildToolExecutionRootUserContext(
     );
 }
 
-const ImageRoute = enum {
-    native,
-    fallback,
-    unavailable,
-};
-
-const VisionPolicy = struct {
-    route: ImageRoute,
-    mode: runtime_gateway_step.VisionToolMode,
-};
-
-fn visionPolicy(
-    image_input_support: model_capabilities.ImageInputSupport,
-    fallback_available: bool,
-    tool_registered: bool,
-    pending_images: bool,
-) VisionPolicy {
-    return switch (image_input_support) {
-        .native => .{ .route = .native, .mode = .unavailable },
-        .unknown => .{ .route = .unavailable, .mode = .unavailable },
-        .non_native => if (!fallback_available or !tool_registered)
-            .{ .route = .unavailable, .mode = .unavailable }
-        else
-            .{
-                .route = .fallback,
-                .mode = if (pending_images) .required else .optional,
-            },
+/// The vision tool mode the request offers, for the mode the image route chose.
+fn visionToolMode(mode: image_route.VisionMode) runtime_gateway_step.VisionToolMode {
+    return switch (mode) {
+        .unavailable => .unavailable,
+        .optional => .optional,
+        .required => .required,
     };
 }
 
-test "vision policy keeps image route and tool visibility coherent" {
-    const cases = [_]struct {
-        image_input_support: model_capabilities.ImageInputSupport,
-        fallback_available: bool,
-        tool_registered: bool,
-        pending_images: bool,
-        expected_route: ImageRoute,
-        expected_mode: runtime_gateway_step.VisionToolMode,
-    }{
-        .{ .image_input_support = .native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .native, .expected_mode = .unavailable },
-        .{ .image_input_support = .native, .fallback_available = false, .tool_registered = false, .pending_images = false, .expected_route = .native, .expected_mode = .unavailable },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .fallback, .expected_mode = .required },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = false, .expected_route = .fallback, .expected_mode = .optional },
-        .{ .image_input_support = .non_native, .fallback_available = false, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = false, .pending_images = false, .expected_route = .unavailable, .expected_mode = .unavailable },
-        .{ .image_input_support = .unknown, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
-    };
-
-    for (cases) |case| {
-        const policy = visionPolicy(
-            case.image_input_support,
-            case.fallback_available,
-            case.tool_registered,
-            case.pending_images,
-        );
-        try std.testing.expectEqual(case.expected_route, policy.route);
-        try std.testing.expectEqual(case.expected_mode, policy.mode);
-        try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
-    }
-
-    const support_values = [_]model_capabilities.ImageInputSupport{
-        .unknown,
-        .non_native,
-        .native,
-    };
-    const boolean_values = [_]bool{ false, true };
-    for (support_values) |support| {
-        for (boolean_values) |fallback_available| {
-            for (boolean_values) |tool_registered| {
-                for (boolean_values) |pending_images| {
-                    const policy = visionPolicy(
-                        support,
-                        fallback_available,
-                        tool_registered,
-                        pending_images,
-                    );
-                    try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
-                    if (support == .native) {
-                        try std.testing.expectEqual(ImageRoute.native, policy.route);
-                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
-                    }
-                    if (support == .unknown) {
-                        try std.testing.expectEqual(ImageRoute.unavailable, policy.route);
-                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
-                    }
-                    if (!fallback_available or !tool_registered) {
-                        try std.testing.expect(policy.mode == .unavailable or support == .native);
-                    }
-                }
-            }
+/// Whether a tool image in `messages` still reaches the request: one the
+/// session keeps, or a handle to materialize. `image_attachments.withholdDroppedImages`
+/// turns the others into notes.
+fn requestHasToolImages(messages: []const ChatMessage) bool {
+    for (messages) |message| {
+        const memory = message.tool_result_memory orelse continue;
+        if (memory.tool_image_handle != null) return true;
+        for (memory.tool_images) |image| {
+            if (!image.droppedFromSession()) return true;
         }
     }
+    return false;
+}
+
+test "requestHasToolImages ignores images the session dropped" {
+    var kept_bytes = "png".*;
+    var mime = "image/png".*;
+    const kept = [_]types.ToolImage{.{ .data = &kept_bytes, .mime_type = &mime }};
+    const dropped = [_]types.ToolImage{.{ .data = &.{}, .mime_type = &mime, .name = @as([64]u8, @splat('0')) }};
+    const with_kept = [_]ChatMessage{.{ .role = .tool, .content = "a", .tool_result_memory = .{ .tool_images = @constCast(&kept) } }};
+    const with_dropped = [_]ChatMessage{.{ .role = .tool, .content = "b", .tool_result_memory = .{ .tool_images = @constCast(&dropped) } }};
+    const with_handle = [_]ChatMessage{.{ .role = .tool, .content = "c", .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") } }};
+    const plain = [_]ChatMessage{.{ .role = .tool, .content = "d" }};
+    try std.testing.expect(requestHasToolImages(&with_kept));
+    try std.testing.expect(!requestHasToolImages(&with_dropped));
+    try std.testing.expect(requestHasToolImages(&with_handle));
+    try std.testing.expect(!requestHasToolImages(&plain));
 }
 
 fn buildProviderPromptForCompactionWindow(
@@ -7073,9 +6871,6 @@ fn processQueuedPromptLoop(
     job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
-    base_nested_terminal_advertised: bool,
-    base_nested_subagent_advertised: bool,
-    base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
@@ -7093,7 +6888,9 @@ fn processQueuedPromptLoop(
     agent: *runtime_agent.Agent,
 ) !void {
     var request_capabilities = initial_request_capabilities;
-    var tool_image_capabilities_resolved = false;
+    // The image route core's turn state. This loop is its shell: it runs each
+    // effect `image_route.step` returns and feeds the result back.
+    var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
     const history_messages = history_messages_ptr.*;
@@ -7229,7 +7026,6 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var ultrafast_unconfirmed_notified = false;
-    var tool_image_strip_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -7522,41 +7318,81 @@ fn processQueuedPromptLoop(
             gateway_messages = provider_prompt.messages;
             current_user_message_index = provider_prompt.current_user_index;
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_instructions.items.len + gateway_messages.items.len });
-            const vision_policy = visionPolicy(
-                request_capabilities.image_input_support,
-                config.provider_capabilities.vision_fallback,
-                deps.tool_registry.lookup("vision") != null,
-                pending_image_ids.len > 0,
-            );
-            const vision_route: runtime_vision_contracts.VisionRoute = if (vision_policy.route == .fallback)
-                .text_only
-            else
-                .native_images;
-            const vision_mode = vision_policy.mode;
-            debug_trace.eventf(
-                "agent",
-                "vision_policy",
-                step_ctx,
-                "model={s} image_support={s} route={s} mode={s} pending_images={d}",
-                .{
-                    gateway_model,
-                    @tagName(request_capabilities.image_input_support),
-                    @tagName(vision_policy.route),
-                    @tagName(vision_mode),
-                    pending_image_ids.len,
-                },
-            );
             try appendRecoveryConversationContext(
                 overlay_arena,
                 &gateway_messages,
                 recovery_strategy,
             );
             const recovery_source_messages = gateway_messages.items;
+            // One image decision per request, read from one capability
+            // snapshot: the core asks for capabilities first when it must,
+            // and every route, mode, and tool image choice below follows the
+            // decision it returns (`tests/tla/image_route/spec/ImageRoute.tla`
+            // OneSnapshot).
+            var image_event: image_route.Event = .{ .request_ready = .{
+                .user_images = job.authorized_image_catalog.len > 0 or job.images.len > 0,
+                .pending_images = pending_image_ids.len > 0,
+                .tool_images = requestHasToolImages(recovery_source_messages),
+                .fallback = config.provider_capabilities.vision_fallback and deps.tool_registry.lookup("vision") != null,
+                .catalog_down = if (deps.model_catalog_unavailable) |unavailable| unavailable(deps.ctx) else false,
+            } };
+            var image_decision: ?image_route.Decision = null;
+            var image_failure: ?image_route.FailReason = null;
+            var notify_catalog_down = false;
+            // Ends: the core asks for capabilities at most once per turn, and
+            // its reply never asks again (ImageRoute.tla ResolveOncePerTurn).
+            while (true) {
+                const image_out = image_route.step(image_route_state, image_event);
+                image_route_state = image_out.state;
+                var reply: ?image_route.Event = null;
+                for (image_out.effects()) |effect| switch (effect) {
+                    .resolve_capabilities => {
+                        request_capabilities = try deps.resolve_model_capabilities(deps.ctx, overlay_arena, gateway_model);
+                        reply = .{ .capabilities_resolved = request_capabilities.image_input_support };
+                    },
+                    .notify_catalog_down => notify_catalog_down = true,
+                    .send => |chosen| image_decision = chosen,
+                    .fail => |reason| image_failure = reason,
+                };
+                image_event = reply orelse break;
+            }
+            if (image_failure) |reason| switch (reason) {
+                .capability_unknown => {
+                    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                    return error.ModelImageCapabilityUnavailable;
+                },
+                .no_native_image => {
+                    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
+                    return error.SubscriptionNativeImageUnavailable;
+                },
+            };
+            // Each request ends in exactly one send or fail (ImageRoute.tla
+            // Answered), so a missing decision is a bug in the core.
+            const image_choice = image_decision.?;
+            const vision_route: runtime_vision_contracts.VisionRoute = if (image_choice.route == .fallback)
+                .text_only
+            else
+                .native_images;
+            const vision_mode = visionToolMode(image_choice.mode);
+            debug_trace.eventf(
+                "agent",
+                "vision_policy",
+                step_ctx,
+                "model={s} image_support={s} route={s} mode={s} pending_images={d} tool_images={s}",
+                .{
+                    gateway_model,
+                    @tagName(image_route_state.support),
+                    @tagName(image_choice.route),
+                    @tagName(image_choice.mode),
+                    pending_image_ids.len,
+                    @tagName(image_choice.tool_images),
+                },
+            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
                     break :blk recovery_source_messages;
                 }
-                break :blk switch (vision_policy.route) {
+                break :blk switch (image_choice.route) {
                     .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
                         recovery_source_messages,
@@ -7575,41 +7411,21 @@ fn processQueuedPromptLoop(
                             job.authorized_image_catalog,
                         );
                     },
-                    .unavailable => switch (request_capabilities.image_input_support) {
-                        .unknown => {
-                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
-                            return error.ModelImageCapabilityUnavailable;
-                        },
-                        .non_native => {
-                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
-                            return error.SubscriptionNativeImageUnavailable;
-                        },
-                        .native => unreachable,
-                    },
+                    // The core fails a request whose user images have no route.
+                    .unavailable => unreachable,
                 };
             };
-            if (vision_policy.route == .native and projected_request_messages.len < recovery_source_messages.len) {
+            if (image_choice.route == .native and projected_request_messages.len < recovery_source_messages.len) {
                 debug_trace.logf("history", "native_vision_history_projected removed_messages={d} reason=native_image_input", .{
                     recovery_source_messages.len - projected_request_messages.len,
                 });
             }
-            const terminal_request_eligible = terminal_request_normalization_eligible(
-                base_nested_terminal_advertised,
-                vision_mode,
-            );
-            const subagent_request_eligible = subagent_request_normalization_eligible(
-                base_nested_subagent_advertised,
-                vision_mode,
-            );
-            const read_tool_result_request_eligible =
-                terminal_request_normalization_eligible(
-                    base_nested_read_tool_result_advertised,
-                    vision_mode,
-                );
+            // Also maps legacy terminal history onto shell.
+            const request_unwrap = request_unwrap_eligible(vision_mode);
             const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
-                terminal_request_eligible,
+                request_unwrap,
                 projected_request_messages,
                 deps.agent_stream_provider,
                 .{ .provider = job.provider, .model = gateway_model },
@@ -7617,7 +7433,7 @@ fn processQueuedPromptLoop(
             const subagent_request_messages = try project_subagent_request_messages(
                 overlay_arena,
                 deps.tool_registry,
-                subagent_request_eligible,
+                request_unwrap,
                 terminal_request_messages,
                 deps.agent_stream_provider,
                 .{ .provider = job.provider, .model = gateway_model },
@@ -7632,19 +7448,10 @@ fn processQueuedPromptLoop(
             // Images the session dropped leave every request as notes.
             const result_request_messages = try image_attachments.withholdDroppedImages(overlay_arena, try project_read_tool_result_request_messages(
                 overlay_arena,
-                read_tool_result_request_eligible,
+                request_unwrap,
                 subagent_request_messages,
             ));
-            if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
-                for (result_request_messages) |message| {
-                    const memory = message.tool_result_memory orelse continue;
-                    if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
-                    request_capabilities = try deps.resolve_model_capabilities(deps.ctx, overlay_arena, gateway_model);
-                    tool_image_capabilities_resolved = true;
-                    break;
-                }
-            }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+            const materialized_messages = if (image_choice.route == .native) native: {
                 const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
                 const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
                 const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
@@ -7657,24 +7464,23 @@ fn processQueuedPromptLoop(
                 );
                 break :native projection.messages;
             } else result_request_messages;
-            const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
+            const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, image_choice.tool_images, config.max_tool_result_bytes);
             // Saved turns keep steering without its envelope; the model gets it
             // back as the live update it saw when the turn took it.
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, steering_messages);
-            if (request_messages.ptr != steering_messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{steering_messages.len});
+            // After the steering rewrap, which recognizes a parent's steering
+            // by how its text starts.
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
+            if (request_messages.ptr != located_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
-            // input are invisible in the transcript otherwise. Tell the user
-            // once per turn, and only when the catalog itself is known to be
-            // down; a confirmed model without image input relies on the
-            // model-facing notice instead.
-            if (image_projection.stripped and !tool_image_strip_notified and
-                request_capabilities.image_input_support == .unknown and
-                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
-            {
-                tool_image_strip_notified = true;
+            // input are invisible in the transcript otherwise. The core asks
+            // to tell the user once per turn, and only when the catalog itself
+            // is known to be down; a confirmed model without image input
+            // relies on the model-facing notice instead.
+            if (notify_catalog_down) {
                 try deps.push_text(deps.ctx, .{ .operational = "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
@@ -8496,13 +8302,13 @@ fn processQueuedPromptLoop(
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,
-                    terminal_request_eligible,
+                    request_unwrap,
                     completion.tool_calls,
                 );
                 completion.tool_calls = try normalize_subagent_request_tool_calls(
                     arena,
                     deps.tool_registry,
-                    subagent_request_eligible,
+                    request_unwrap,
                     completion.tool_calls,
                 );
             }
@@ -8587,7 +8393,7 @@ fn processQueuedPromptLoop(
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,
-                    streamReplaySafe(&stream_ctx),
+                    attemptReplaySafe(&stream_ctx),
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
@@ -9921,6 +9727,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
@@ -11170,6 +10979,13 @@ fn processQueuedPromptLoop(
                                     prepared_terminal.memory,
                                     null,
                                     advertised_dynamic_tool_names,
+                                );
+                                try runtime_tool_admission.recordRejectedToolCall(
+                                    deps,
+                                    arena,
+                                    tool_call,
+                                    safe_output,
+                                    null,
                                 );
                                 try runtime_tool_batch.appendToolResultContent(
                                     arena,
@@ -12715,6 +12531,17 @@ fn processQueuedPromptLoop(
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        "",
+                    )) {
+                        stop_state.retained_candidate = null;
+                        stop_state.latest_partial = null;
+                        continue :agent_steps_loop;
+                    }
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try runtime_interruption.persistInterruptedTurnOnce(
                         deps,
@@ -12738,6 +12565,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,

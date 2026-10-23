@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_data = @import("../../images/image_data.zig");
 const utf8PrefixLength = @import("../../config/context_limits.zig").utf8PrefixLength;
 
 const Allocator = std.mem.Allocator;
@@ -137,9 +138,7 @@ fn withhold(arena: Allocator, messages: []const ChatMessage, withheld: usize, to
 
 fn writeAttachmentNotice(writer: *std.Io.Writer, image: types.ImageAttachment) std.Io.Writer.Error!void {
     try writer.print("[Image #{d} not sent to keep the request under the provider's size limit.", .{image.id});
-    if (image.inline_data == null) {
-        if (image.snapshot_path) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
-    }
+    if (image_attachments.savedImagePath(image)) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
     try writer.writeAll("]\n");
 }
 
@@ -292,6 +291,25 @@ test "withheld snapshot attachments point at their saved file" {
         "[Image #3 not sent to keep the request under the provider's size limit. The original is saved at /home/u/.fx/sessions/s/images/3.bin; read_file it to see it again.]\n",
         notice.written(),
     );
+}
+
+test "a prompt image left out for size names its session's blob (D89)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var image = try image_attachments.captureInlineImageBytesInMemory(arena, 1, "image/png", &image_data.testPngHeader(10, 10));
+    image.snapshot_path = try arena.dupe(u8, "/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
+    image.blob_path = try arena.dupe(u8, "/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+    const in_blob = [_]ChatMessage{.{ .role = .user, .content = "look", .images = &.{image} }};
+    const named = try withholdImagesPastLimit(arena, &in_blob, 1, 4096);
+    try std.testing.expectEqual(@as(usize, 1), named.withheld);
+    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.fx/sessions/v2/s/blobs/0123abcd;") != null);
+    // Inline bytes without a blob have no saved file to name.
+    var unsaved = image;
+    unsaved.blob_path = null;
+    const inline_only = [_]ChatMessage{.{ .role = .user, .content = "look", .images = &.{unsaved} }};
+    const unnamed = try withholdImagesPastLimit(arena, &inline_only, 1, 4096);
+    try std.testing.expect(std.mem.find(u8, unnamed.messages[0].content.?, "saved at") == null);
 }
 
 test "a withheld tool image without a saved handle says so plainly" {

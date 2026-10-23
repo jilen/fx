@@ -5611,7 +5611,7 @@ test "processQueuedPrompt retries one clear language mismatch without publishing
     );
 }
 
-test "processQueuedPrompt fails a second clear language mismatch without assistant history" {
+test "processQueuedPrompt keeps a second clear language mismatch with a notice" {
     const alloc = std.testing.allocator;
     const first_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
     const second_chunks = [_][]const u8{"Сначала я проверю файл блокировки и манифест."};
@@ -5629,14 +5629,18 @@ test "processQueuedPrompt fails a second clear language mismatch without assista
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
 
-    try std.testing.expectError(
-        error.ResponseLanguageMismatch,
-        runFakePrompt(&gateway, &hooks, config, job),
-    );
+    try runFakePrompt(&gateway, &hooks, config, job);
 
+    // The one correction retry ran, and the second mismatch is delivered with
+    // an explanatory notice instead of discarding the reply and ending the turn.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(second_chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        second_chunks[0],
+        hooks.history_turns.items[0].assistant.assistant,
+    );
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(
         u8,

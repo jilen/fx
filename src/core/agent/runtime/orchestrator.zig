@@ -97,7 +97,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model answered in a different language than your request, so the reply is kept as received. Ask again or name the response language explicitly.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -8981,7 +8981,7 @@ fn processQueuedPromptLoop(
                             "agent",
                             "response_language_mismatch",
                             step_ctx,
-                            "expected={s} observed={s} model={s} attempt={d}/{d} retry={s}",
+                            "expected={s} observed={s} model={s} attempt={d}/{d} retry={s} kept={s}",
                             .{
                                 @tagName(response_language_expectation.?),
                                 @tagName(observed),
@@ -8989,6 +8989,7 @@ fn processQueuedPromptLoop(
                                 semantic_attempt + 1,
                                 semantic_limit,
                                 if (can_retry) "true" else "false",
+                                if (can_retry) "false" else "true",
                             },
                         );
                         if (can_retry) {
@@ -9007,10 +9008,12 @@ fn processQueuedPromptLoop(
                             reset_stream_for_next_attempt = true;
                             continue;
                         }
-                        stream_ctx.drop_staged_response_language_candidate();
+                        // A second mismatch is the model's own choice, not a
+                        // reason to throw away a complete answer. Publish the
+                        // reply and tell the user its language did not match
+                        // instead of failing the turn.
+                        try stream_ctx.accept_staged_response_language();
                         try deps.push_system_notice(deps.ctx, response_language_failure_notice);
-                        finish_trace.finish("response_language_mismatch");
-                        return error.ResponseLanguageMismatch;
                     },
                 }
             }

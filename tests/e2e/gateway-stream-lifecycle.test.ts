@@ -4138,6 +4138,61 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask keeps a repeated response language mismatch with a notice", async () => {
+    const root = createFixtureRoot("response-language-kept");
+    const tracePath = join(root.root, "kept-trace.log");
+    const answer = "我会先检查锁文件和依赖清单。";
+    const responses = [
+      fakeGatewayFinalText(answer),
+      fakeGatewayFinalText(answer),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const first = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "The lockfile is broken again. Say what you will inspect next.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
+        session_id: string;
+      };
+      const eventsPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "events.jsonl",
+      );
+
+      // One correction retry ran, then the second mismatch kept the reply
+      // instead of ending the turn, with a notice explaining the language.
+      expect(first.code).toBe(0);
+      expect(firstJson.output).toContain(answer);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(first.stderr).toContain(
+        "answered in a different language than your request",
+      );
+      expect(readFileSync(eventsPath, "utf8")).toContain(answer);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("legacy tool projection preserves surviving calls and replay through saved resume", async () => {
     for (const { tool, input } of [
       { tool: "terminal", input: { action: "read", session_id: "missing" } },

@@ -232,7 +232,24 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
+    var rejection: codec.Rejection = .{};
+    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress, &rejection) catch |err| switch (err) {
+        // Use the runtime's terminal provider-failure path: it publishes the
+        // diagnostic and preserves streamed prose without executing partial
+        // calls or retrying a response the codec could not validate.
+        error.InvalidChunk => .{ .completed = .{
+            .ownership = .owned,
+            .completion = .{
+                .finish_reason = .provider_error,
+                .provider_failure_cause = .non_retryable,
+                .provider_failure_detail = try alloc.print(
+                    "InvalidChunk: Invalid Chat Completions response at {s} (event {d}).",
+                    .{ @tagName(rejection.field), rejection.event },
+                ),
+            },
+        } },
+        else => return err,
+    };
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.

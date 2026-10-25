@@ -656,6 +656,42 @@ const Tool = struct {
     }
 };
 
+/// Content-free location of a rejected event. Field names are codec-owned;
+/// no provider text, reasoning, or tool arguments are retained here.
+pub const Rejection = struct {
+    event: usize = 0,
+    field: enum {
+        json,
+        chunk,
+        id,
+        model,
+        choices,
+        @"choices[0]",
+        @"choices[0].index",
+        @"choices[0].delta",
+        @"delta.role",
+        @"delta.function_call",
+        @"delta.audio",
+        @"delta.reasoning",
+        @"delta.reasoning_content",
+        @"delta.reasoning_details",
+        @"delta.content",
+        @"delta.refusal",
+        @"delta.tool_calls",
+        @"tool_calls[].index",
+        @"tool_calls[].type",
+        @"tool_calls[].id",
+        @"tool_calls[].function",
+        @"tool_calls[].function.name",
+        @"tool_calls[].function.arguments",
+        usage,
+        @"usage.prompt_tokens",
+        @"usage.completion_tokens",
+        @"usage.total_tokens",
+        @"choices[0].finish_reason",
+    } = .json,
+};
+
 /// Single-owner, request-local state machine. No I/O, callbacks, tool execution,
 /// or hidden cancellation reads. Owns all retained input until deinit. Any
 /// accept/finish failure poisons the reducer; deinit remains mandatory. A
@@ -690,6 +726,7 @@ pub const Reducer = struct {
     phase: enum { receiving, finished, done, closed } = .receiving,
     event_count: usize = 0,
     json_bytes: usize = 0,
+    rejection: Rejection = .{},
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
         try validate_request(request);
@@ -712,6 +749,7 @@ pub const Reducer = struct {
     /// callers must also bound framing wire; consume_stream includes comments.
     pub fn accept(self: *Reducer, data: []const u8, cancelled: bool) Error!Deltas {
         errdefer self.phase = .closed;
+        self.rejection = .{ .event = self.event_count +| 1 };
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed or self.phase == .done) return error.StreamClosed;
         if (data.len > self.limits.event_bytes) return error.EventTooLarge;
@@ -730,23 +768,32 @@ pub const Reducer = struct {
             else => return error.InvalidChunk,
         };
         defer parsed.deinit();
+        self.rejection.field = .chunk;
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
+        self.rejection.field = .id;
         try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
+        self.rejection.field = .model;
         try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        self.rejection.field = .choices;
         const choices_value = root.get("choices") orelse return error.InvalidChunk;
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
         if (choices.len > 1) return error.InvalidChunk;
         if (choices.len == 0) {
             if (self.phase != .finished) return error.InvalidChunk;
+            self.rejection.field = .usage;
             try self.accept_usage(non_null(root, "usage") orelse return error.InvalidChunk, true);
             return .{};
         }
+        self.rejection.field = .@"choices[0]";
         const choice = try object(choices[0]);
+        self.rejection.field = .@"choices[0].index";
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
+        self.rejection.field = .@"choices[0].delta";
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
+            self.rejection.field = .@"choices[0].finish_reason";
             const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
             if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
             var fields = delta.iterator();
@@ -760,18 +807,25 @@ pub const Reducer = struct {
             try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason, true);
             return .{};
         }
+        self.rejection.field = .@"delta.role";
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
         // These fields carry semantics outside this codec's text/function subset.
-        for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
+        for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) {
+            self.rejection.field = if (std.mem.eql(u8, key, "audio")) .@"delta.audio" else .@"delta.function_call";
+            return error.InvalidChunk;
+        };
         const reasoning_delta = try self.accept_reasoning(delta);
         const content_start = self.content.items.len;
+        self.rejection.field = .@"delta.content";
         if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
+        self.rejection.field = .@"delta.refusal";
         if (non_null(delta, "refusal")) |value| {
             const refusal = try string(value);
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
         if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
         if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
+        self.rejection.field = .@"choices[0].finish_reason";
         if (non_null(choice, "finish_reason")) |value| {
             const reason = try string(value);
             self.finish_reason = if (std.mem.eql(u8, reason, "stop")) .stop else if (std.mem.eql(u8, reason, "tool_calls")) .tool_calls else if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "content_filter")) .content_filter else return error.InvalidFinishReason;
@@ -787,6 +841,7 @@ pub const Reducer = struct {
         var deltas: [2]?[]const u8 = @splat(null);
         for (reasoning_fields, &self.reasoning, 0..) |key, *part, index| {
             const value = fields.get(key) orelse continue;
+            self.rejection.field = if (index == 0) .@"delta.reasoning" else .@"delta.reasoning_content";
             if (value == .null) {
                 if (part.presence == .absent) part.presence = .null_value;
                 continue;
@@ -801,6 +856,7 @@ pub const Reducer = struct {
             if (text.len != 0) deltas[index] = part.bytes.items[start..];
         }
         if (fields.get("reasoning_details")) |value| {
+            self.rejection.field = .@"delta.reasoning_details";
             const part = &self.reasoning_details;
             if (value == .null) {
                 if (part.presence == .absent) part.presence = .null_value;
@@ -871,11 +927,14 @@ pub const Reducer = struct {
     }
 
     fn accept_tools(self: *Reducer, value: std.json.Value) Error!void {
+        self.rejection.field = .@"delta.tool_calls";
         if (value != .array) return error.InvalidChunk;
         if (value.array.items.len > self.limits.tool_calls) return error.TooManyTools;
         if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
         for (value.array.items, 0..) |item, delta_index| {
+            self.rejection.field = .@"delta.tool_calls";
             const delta = try object(item);
+            self.rejection.field = .@"tool_calls[].index";
             const index = try index_value(delta.get("index") orelse return error.InvalidChunk);
             if (index >= self.limits.tool_calls) return error.TooManyTools;
             for (value.array.items[0..delta_index]) |prior| {
@@ -883,10 +942,12 @@ pub const Reducer = struct {
             }
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
+            self.rejection.field = .@"tool_calls[].type";
             if (non_null(delta, "type")) |kind| {
                 const text = try string(kind);
                 if (text.len != 0 and !std.mem.eql(u8, text, "function")) return error.InvalidChunk;
             }
+            self.rejection.field = .@"tool_calls[].id";
             if (non_null(delta, "id")) |value_id| {
                 const id = try string(value_id);
                 if (id.len != 0) try self.accept_identity(&tool.id, value_id, self.limits.identity_bytes);
@@ -895,22 +956,30 @@ pub const Reducer = struct {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
             };
             if (non_null(delta, "function")) |function_value| {
+                self.rejection.field = .@"tool_calls[].function";
                 const function = try object(function_value);
+                self.rejection.field = .@"tool_calls[].function.name";
                 if (non_null(function, "name")) |name_value| {
                     const fragment = try string(name_value);
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
                 }
+                self.rejection.field = .@"tool_calls[].function.arguments";
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
+        self.rejection.field = .usage;
         const fields = try object(value);
+        self.rejection.field = .@"usage.prompt_tokens";
+        const input_tokens = try token_count(fields, "prompt_tokens");
+        self.rejection.field = .@"usage.completion_tokens";
         const incoming = types.Usage{
-            .input_tokens = try token_count(fields, "prompt_tokens"),
+            .input_tokens = input_tokens,
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
+        self.rejection.field = .@"usage.total_tokens";
         const incoming_total = try token_count(fields, "total_tokens");
         if (reports_only_zeros(incoming, incoming_total)) return;
         const usage = types.Usage{
@@ -1090,7 +1159,8 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
 /// `progress`, when set, is told about each data event.
-pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress) Error!stream_provider.Result {
+/// `rejection`, when set, receives the content-free location of an accept error.
+pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress, rejection: ?*Rejection) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
     defer reducer.deinit();
@@ -1106,6 +1176,8 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
         };
         const chunk = data orelse return error.IncompleteStream;
         const deltas = reducer.accept(chunk, cancel_flag.load(.seq_cst)) catch |err| {
+            if (rejection) |out| out.* = reducer.rejection;
+            debug_trace.logf("gateway", "chat_chunk_rejected err={s} field={s} event={d} bytes={d}", .{ @errorName(err), @tagName(reducer.rejection.field), reducer.event_count, chunk.len });
             if (io_mod.getenv("FX_TRACE_CHAT_CHUNKS")) |enabled| {
                 if (std.mem.eql(u8, enabled, "1")) {
                     debug_trace.logf("gateway", "chat_chunk_rejected err={s} event={d} bytes={d} chunk={s}", .{ @errorName(err), reducer.event_count, chunk.len, chunk });
@@ -1170,6 +1242,39 @@ fn test_finish(reducer: *Reducer, terminal: []const u8) Error!stream_provider.Re
     try test_accept(reducer, terminal);
     try test_accept(reducer, "[DONE]");
     return reducer.finish(false);
+}
+
+test "chat completions rejected events expose content-free field locations" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { chunk: []const u8, field: []const u8 }{
+        .{ .chunk = "not JSON", .field = "json" },
+        .{ .chunk = "[]", .field = "chunk" },
+        .{ .chunk = "{\"id\":7}", .field = "id" },
+        .{ .chunk = "{\"model\":7}", .field = "model" },
+        .{ .chunk = "{\"choices\":[]}", .field = "choices" },
+        .{ .chunk = "{\"choices\":[{}]}", .field = "choices[0].index" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":null}]}", .field = "choices[0].delta" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"private-value\"}}]}", .field = "delta.role" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":{}}}]}", .field = "delta.content" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":{}}}]}", .field = "delta.reasoning" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":{}}}]}", .field = "delta.reasoning_content" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[null]}}]}", .field = "delta.reasoning_details" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{}]}}]}", .field = "tool_calls[].index" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":{}}}]}}]}", .field = "tool_calls[].function.arguments" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":-1}}", .field = "usage.prompt_tokens" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"completion_tokens\":1.5}}", .field = "usage.completion_tokens" },
+        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":12}}", .field = "usage.total_tokens" },
+    };
+    for (cases) |case| {
+        const wire = try alloc.print("data: {s}\n\ndata: {s}\n\n", .{ test_text, case.chunk });
+        defer alloc.free(wire);
+        var reader: std.Io.Reader = .fixed(wire);
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var rejection: Rejection = .{};
+        try std.testing.expectError(error.InvalidChunk, consume_stream(alloc, &reader, test_tool_request(), .{}, null, &cancel, null, &rejection));
+        try std.testing.expectEqual(@as(usize, 2), rejection.event);
+        try std.testing.expectEqualStrings(case.field, @tagName(rejection.field));
+    }
 }
 
 test "chat completions empty tool metadata preserves fragmented calls" {
@@ -1594,9 +1699,9 @@ test "chat completions reasoning presentation checks cancellation before content
         var source = std.Io.Reader.fixed(wire);
         const sink: stream_provider.EventSink = .{ .context = &observer, .emit_fn = Observer.emit };
         if (cancel) {
-            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null));
+            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null, null));
         } else {
-            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null);
+            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null, null);
             defer result.deinit(std.testing.allocator);
         }
         try std.testing.expectEqual(@as(usize, 1), observer.reasoning_count);
@@ -2515,32 +2620,32 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         defer alloc.free(buffer);
         var fixed = std.Io.Reader.fixed(wire);
         var source = fixed.limited(.unlimited, buffer);
-        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, null);
+        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, null, null);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
     for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
-        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
+        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null, null));
     }
     {
         var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n", 20));
-        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled, null));
+        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled, null, null));
     }
     {
         var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n\n", 20));
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled, null));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled, null, null));
     }
     {
         var source = std.Io.Reader.fixed(wire);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled, null));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled, null, null));
     }
     // A terminal delimiter is sufficient: never wait for a failing next read.
     var source = std.Io.Reader.failing;
     source.buffer = @constCast(wire);
     source.end = wire.len;
-    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null, null);
     defer result.deinit(alloc);
 }
 
@@ -2589,7 +2694,7 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     const cancelled = std.atomic.Value(bool).init(false);
-    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null);
+    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null, null);
     defer result.deinit(std.testing.allocator);
 
     if (result != .completed) return error.TestStreamFailed;
@@ -2637,7 +2742,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     var cancelled = std.atomic.Value(bool).init(true);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null, null));
     var request = test_request();
     request.budget = .{ .cancel_flag = &cancelled };
     const serialized = try build_request(alloc, request, .{});
@@ -2654,7 +2759,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     var observer = Observer{ .flag = &cancelled };
     cancelled.store(false, .seq_cst);
     source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled, null));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled, null, null));
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
@@ -2667,7 +2772,7 @@ fn test_allocation_paths(alloc: Allocator) !void {
     defer alloc.free(body);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish ++ "\n\ndata: [DONE]\n\n");
     const cancelled = std.atomic.Value(bool).init(false);
-    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled, null);
+    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled, null, null);
     defer result.deinit(alloc);
 }
 
@@ -2870,7 +2975,7 @@ test "chat completions exact wire and aggregate delta bounds include the termina
     const wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n";
     const cancelled = std.atomic.Value(bool).init(false);
     var source = std.Io.Reader.fixed(wire);
-    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled, null);
+    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled, null, null);
     defer result.deinit(alloc);
     for ([_]struct { limits: Limits, failure: Error }{
         .{ .limits = .{ .total_wire_bytes = test_text.len }, .failure = error.StreamTooLarge },

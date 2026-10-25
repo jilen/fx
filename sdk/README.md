@@ -395,6 +395,8 @@ const agent = createFxAgent({
 
 Requests go to `{baseUrl}/chat/completions`, which must use HTTPS, or HTTP on `localhost`. Leave out `credentials` for a server that needs no key. `models` tells libfx what it can't ask the server: each model's context window and output limit, and whether it takes tools and images. A key isn't refreshed, so a rejected one ends the turn with the server's error. In a browser, the server must accept cross-origin requests, and the page can read the key.
 
+An `InvalidChunk` notice identifies the rejected Chat Completions field and event number without including the raw response. The turn stops, preserves text already streamed, and leaves that response's tool calls unexecuted.
+
 Saved sessions follow the agent's provider: point an agent at another base URL and its sessions continue there, history included.
 
 ### Where credentials go

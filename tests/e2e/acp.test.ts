@@ -867,6 +867,76 @@ test("ACP load and resume negotiate hooks and clear them when omitted", async ()
   } finally { await client.close(); fixture.close(); }
 }, 30000);
 
+test.each(["disabled", "enabled"])("configured provider ACP diagnoses InvalidChunk without raw tracing (trace %s)", async tracing => {
+  const trace = tracing === "enabled";
+  let calls = 0;
+  const fixture = createConfiguredProviderFixture(async body => {
+    if (++calls > 1) return configuredCompletion(body.model, "follow-up succeeded");
+    const response = configuredToolCompletion(body.model, "write_file", { path: "must-not-exist.txt", content: "unexecuted" });
+    const partial = { choices: [{ index: 0, delta: { content: "Partial answer before rejection." } }] };
+    const rejected = { choices: [], usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 12 }, private: "private upstream chunk" };
+    const wire = `data: ${JSON.stringify(partial)}\n\n` + (await response.text()).replace("data: [DONE]", `data: ${JSON.stringify(rejected)}\n\ndata: [DONE]`);
+    return new Response(wire, { headers: response.headers });
+  });
+  const tracePath = join(fixture.home, "trace.log");
+  const client = await AcpClient.create({
+    cwd: fixture.workspace,
+    env: { ...fixture.env, FX_TRACE: undefined, FX_TRACE_LOG: trace ? tracePath : undefined, FX_TRACE_STDERR: undefined, FX_TRACE_SCOPES: undefined, FX_TRACE_CHAT_CHUNKS: undefined },
+  });
+  try {
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    expect(created.error).toBeUndefined();
+    const first = await client.request("session/prompt", { prompt: [{ type: "text", text: "Write a file" }] }) as any;
+    expect(first.error).toBeDefined();
+    const notifications = client.rawLines.map(line => JSON.parse(line)).filter(message => message.method === "session/update");
+    const text = notifications.map(message => message.params?.update?.content?.text ?? "").join("");
+    expect(text).toContain("Partial answer before rejection.");
+    expect(text).toContain("InvalidChunk: Invalid Chat Completions response at usage.total_tokens (event 4).");
+    expect(client.rawLines.join("\n")).not.toContain("private upstream chunk");
+    expect(existsSync(join(fixture.workspace, "must-not-exist.txt"))).toBe(false);
+    expect(fixture.requests).toHaveLength(1);
+    expect(logLines(fixture.home, created.result.sessionId).some(line => JSON.stringify(line).includes("Partial answer before rejection."))).toBe(true);
+
+    const second = await client.request("session/prompt", { prompt: [{ type: "text", text: "Continue" }] }) as any;
+    expect(second.error).toBeUndefined();
+    expect(second.result.stopReason).toBe("end_turn");
+    expect(fixture.requests).toHaveLength(2);
+    expect(fixture.requests[1].body.messages.some((message: any) => message.role === "assistant" && message.content?.includes("Partial answer before rejection."))).toBe(true);
+    expect(fixture.requests[1].body.messages.some((message: any) => message.tool_calls?.length)).toBe(false);
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    expect(client.stderr).toBe("");
+    if (trace) {
+      const savedTrace = readFileSync(tracePath, "utf8");
+      expect(savedTrace).toContain("chat_chunk_rejected err=InvalidChunk field=usage.total_tokens event=4");
+      expect(savedTrace).not.toContain("private upstream chunk");
+    }
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
+test("configured provider ACP accepts a follow-up after InvalidChunk before any output", async () => {
+  let calls = 0;
+  const fixture = createConfiguredProviderFixture(body => ++calls === 1
+    ? new Response('data: {"choices":[{"index":0,"delta":null}]}\n\n', { headers: { "content-type": "text/event-stream" } })
+    : configuredCompletion(body.model, "follow-up succeeded"));
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] });
+    const first = await client.request("session/prompt", { prompt: [{ type: "text", text: "First request" }] }) as any;
+    expect(first.error).toBeDefined();
+    expect(client.rawLines.join("\n")).toContain("InvalidChunk: Invalid Chat Completions response at choices[0].delta (event 1).");
+    const second = await client.request("session/prompt", { prompt: [{ type: "text", text: "Continue" }] }) as any;
+    expect(second.error).toBeUndefined();
+    expect(second.result.stopReason).toBe("end_turn");
+    expect(fixture.requests).toHaveLength(2);
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    expect(client.stderr).toBe("");
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
 test("configured provider ACP preserves reasoning between prompts", async () => {
   const fixture = createConfiguredProviderFixture(async body => {
     const response = configuredCompletion(body.model, "reasoned answer");

@@ -10,6 +10,8 @@ Run `/feedback` inside fx to open the feedback form, or [open an issue](https://
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
+For a configured Chat Completions provider, an `InvalidChunk` diagnostic names the rejected field and the event number. Include both in a bug report. fx stops that response without executing its tool calls and preserves text already streamed. To capture the rejected JSON from a checkout, build fx and start the failing process with `FX_TRACE_CHAT_CHUNKS=1` and `FX_TRACE_LOG=/tmp/fx-chat-chunks.log`. For ACP, set these variables in the client configuration that launches `./zig-out/bin/fx acp`. The raw log can contain model output and tool arguments, so review it before sharing it. Ordinary tracing records the error location without the raw JSON.
+
 ## Set up a checkout
 
 You need:

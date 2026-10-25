@@ -135,6 +135,19 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("InvalidChunk reports its field and event without exposing the response body", async () => {
+    const f = fixture(() => new Response('data: {"choices":[{"index":0,"delta":{"content":{"private":"private upstream chunk"}}}]}\n\n', { headers: { "content-type": "text/event-stream" } }));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env });
+      expect(result.code).toBe(1);
+      expect(() => JSON.parse(result.stdout)).not.toThrow();
+      expect(result.stdout + result.stderr).toContain("InvalidChunk: Invalid Chat Completions response at delta.content (event 1).");
+      expect(result.stdout + result.stderr).not.toContain("private upstream chunk");
+      expect(result.stderr).not.toContain("panic");
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  });
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);

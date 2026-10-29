@@ -853,7 +853,9 @@ fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtim
 
 /// A call that ended without an answer.
 fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(runtime_mod.CallResult, "ended"), max_bytes: usize, how: SignIn) !tool_mcp_runtime.CallResult {
-    if (e.outcome == .cancelled) return error.Cancelled;
+    // A call fx stopped waiting for ends cancelled too, but the model hears
+    // that it ran out of time rather than that someone cancelled it.
+    if (e.outcome == .cancelled and !e.timed_out) return error.Cancelled;
     const why = switch (e.outcome) {
         .needs_auth => return .{
             .model_output = try tool_result_limits.prepareModelOutput(arena, name, try needsLoginText(arena, server, how), max_bytes),
@@ -1132,4 +1134,9 @@ test "a search says why a server it names has no tools, and calls that end say h
     try testing.expect(std.mem.find(u8, unrenewed.model_output, "its login couldn't be renewed because the sign-in server didn't answer. The tool didn't run; try again shortly.") != null);
     try testing.expect(std.mem.find(u8, unrenewed.model_output, "may have run") == null);
     try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096, .terminal));
+    // The engine ends a call that runs out of time as cancelled; the model
+    // hears the timeout, not a cancellation.
+    const slow = try ended(a, "aside", "mcp_aside_repl", .{ .outcome = .cancelled, .maybe_ran = true, .timed_out = true }, 4096, .terminal);
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, slow.status);
+    try testing.expect(std.mem.find(u8, slow.model_output, "MCP server 'aside' ended the call: it did not answer in time. The tool may have run.") != null);
 }

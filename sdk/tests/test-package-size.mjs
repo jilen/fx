@@ -4,6 +4,10 @@
 // were set at; raise one only for a change that has to grow the package, and
 // say so in the change.
 //
+// It also checks how each native addon was compiled (addNapiArtifact in
+// build.zig): each one leaves out unwind tables, which a budget's headroom
+// would not catch, and keeps frame pointers, which Apple's ABI requires.
+//
 //   node sdk/tests/test-package-size.mjs <libfx.tgz> --native-dir <dir> [--print]
 //
 // --print prints the measured sizes as budgets JSON instead of checking them.
@@ -49,11 +53,32 @@ try {
 } finally {
   await rm(libfx.dir, { recursive: true, force: true });
 }
+// Functions that point the frame pointer at their frame record: on arm64,
+// `add x29, sp, #imm` (or `mov x29, sp`); on x86-64, `push rbp; mov rbp, rsp`.
+// An addon built with frame pointers has about 5,000, and one built without
+// them a few hundred at most.
+function frameRecordSetups(addon, packageName) {
+  let count = 0;
+  if (packageName.includes("arm64")) {
+    for (let i = 0; i + 4 <= addon.length; i += 4) if (((addon.readUInt32LE(i) & 0xffc003ff) >>> 0) === 0x910003fd) count++;
+  } else {
+    const setup = Buffer.from([0x55, 0x48, 0x89, 0xe5]);
+    for (let i = addon.indexOf(setup); i !== -1; i = addon.indexOf(setup, i + 1)) count++;
+  }
+  return count;
+}
+const miscompiled = [];
 for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   const platform = await measurePackage(path);
   measured[name] = { packed: platform.packed, unpacked: platform.unpacked };
+  const addon = await readFile(join(platform.dir, "libfx.node"));
+  // .eh_frame on Linux, __eh_frame and __unwind_info on macOS.
+  for (const section of ["eh_frame", "__unwind_info"]) if (addon.includes(section)) miscompiled.push(`${name}: has ${section}`);
+  const frames = frameRecordSetups(addon, name);
+  if (frames < 1000) miscompiled.push(`${name}: only ${frames} functions set up a frame record`);
   await rm(platform.dir, { recursive: true, force: true });
 }
+assert.deepEqual(miscompiled, [], `a native addon was built with the wrong code generation settings; see addNapiArtifact in build.zig:\n${miscompiled.join("\n")}`);
 
 if (process.argv.includes("--print")) {
   console.log(JSON.stringify(measured, null, 2));
@@ -72,4 +97,4 @@ for (const [name, sizes] of Object.entries(measured)) {
   }
 }
 assert.deepEqual(over, [], `over budget. A .wasm over its budget may have skipped sdk/scripts/optimize-wasm.mjs:\n${over.join("\n")}`);
-console.log(`Package sizes passed: ${Object.keys(measured).length} files and packages within their budgets`);
+console.log(`Package sizes passed: ${Object.keys(measured).length} files and packages within their budgets, and every native addon has the expected code generation settings`);

@@ -99,7 +99,7 @@ swap-compares` rewrites each greater-than comparison as the less-than
 comparison with its operands swapped, so the outliner only matches comparisons
 written the same way.
 
-Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
 allocation, the writer's `write`, `writeAll`, `writeByte`, and
@@ -110,12 +110,20 @@ runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if
 the allocator `free` helper does not match. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
-into stores of their defined bytes, then `globaldce,verify` drops the dead
-constants. Zig emits such a constant for each `return error.X` from a
-function returning a large error union. Undefined bytes become "destination
-unchanged", a refinement of copying undefined bytes; explicit values,
-including zeros, are still stored. Benchmark artifacts receive both passes so
-their candidates keep the production code shape. The candidate link passes
+into stores of their defined bytes. Zig emits such a constant for each
+`return error.X` from a function returning a large error union. Undefined
+bytes become "destination unchanged", a refinement of copying undefined
+bytes; explicit values, including zeros, are still stored. The constants it
+cannot rewrite, because a load, a PHI, or a call still reads them, go to
+`overlay-constants`, along with `return null` results of large optionals. It
+packs them into one constant where they overlap: they are `unnamed_addr`, so
+only their defined bytes matter, and two may share bytes wherever neither
+defines a byte the other defines differently. Each becomes an alias of its
+offset. Members that hot code reads, or that are under 64 bytes, never
+receive another member's nonzero byte in their undefined bytes, so their
+copies still compile as before. `globaldce,verify` then drops the dead
+constants. Benchmark artifacts receive every pass so their candidates keep
+the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
 

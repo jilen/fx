@@ -2461,7 +2461,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("xAI");
       expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context · 32K output · Fast");
+      expect(pane).toContain("1M context · 32K output · Fast mode");
       expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
       const headerRow = grid.findIndex((line) => line.includes("Models 4"));
       const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));

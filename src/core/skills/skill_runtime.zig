@@ -1339,6 +1339,23 @@ fn skillMatch(skill: Skill, query: []const u8) ?fuzzy_match.Match {
     });
 }
 
+/// Whether a `$` mention menu stays open for `query`. Sending a prompt ends
+/// a mention at the first byte that cannot continue a skill name
+/// (`matchesSigilSkillAt`), so `$fx-commit.` is a finished mention and Enter
+/// must send it. A query holding such a byte keeps the menu open only for a
+/// skill whose name contains the query as typed, as `$my.sk` does for
+/// `my.skill`.
+fn mentionMenuOpen(skills: []const Skill, query: []const u8) bool {
+    for (query) |byte| {
+        if (!isSkillNameContinuation(byte)) break;
+    } else return skillMenuFilterQueryCount(skills, .all, query) > 0;
+    for (skills) |skill| {
+        const found = fuzzy_match.match(query, &.{.{ .text = skill.name }}) orelse continue;
+        if (@backingInt(found.tier) >= @backingInt(fuzzy_match.Tier.substring)) return true;
+    }
+    return false;
+}
+
 /// The skills menu's base order is source group, then catalog order, so
 /// base position `group * skills.len + index` holds skill `index` only when
 /// it is in source group `group`.
@@ -2614,7 +2631,7 @@ pub const Runtime = struct {
     pub fn menuVisible(self: Runtime) bool {
         if (!self.menu.active) return false;
         if (!self.menu.origin.isMention()) return true;
-        return skillMenuFilterQueryCount(self.items, .all, self.menu.query()) > 0;
+        return mentionMenuOpen(self.items, self.menu.query());
     }
 };
 
@@ -3918,6 +3935,29 @@ test "skill menu visibility hides only zero-result mention queries" {
 
     runtime.closeMenu();
     try std.testing.expect(!runtime.menuVisible());
+}
+
+test "a mention menu closes once its query holds a byte that ends the mention" {
+    const skills = [_]Skill{
+        staticSkill("status-second", "Status fixture", .workspace_shared),
+        staticSkill("my.skill", "Dotted name", .global_fx),
+    };
+    var runtime = Runtime{ .items = @constCast(&skills) };
+    runtime.openMenuWithQuery(.dollar, .{ .start = 4, .end = 5 }, "");
+
+    runtime.menu.setQuery("statsec");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second.");
+    try std.testing.expect(!runtime.menuVisible());
+    runtime.menu.setQuery("my.sk");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("my.skill,");
+    try std.testing.expect(!runtime.menuVisible());
+
+    runtime.openMenuWithQuery(.command, null, "status-second.");
+    try std.testing.expect(runtime.menuVisible());
 }
 
 test "skill menu movement uses rendered visible rows before scrolling" {

@@ -4,10 +4,12 @@
 
 <!-- release:start -->
 
-**fx reuses more cached instructions across workspaces and mid-session changes. The libfx terminal's WebAssembly binary is 20.2% smaller (3.39 MiB vs 4.24 MiB).**
+**fx uses 41% fewer uncached input tokens in a ten-model comparison with 0.0.15. The libfx terminal's WebAssembly binary is 20.2% smaller (3.39 MiB vs 4.24 MiB).**
 
 ### Improvements
 
+- Across ten model families, caching scenarios used 41% fewer uncached input tokens than 0.0.15. Requests that broke the cached prompt prefix fell from 80 to 10, an 87.5% reduction.
+- Uncached input tokens fell 79% on Claude Sonnet 5.5, 78% on Claude Haiku 5.5, and 76% on GPT-6.1 in that comparison. Results varied by model, with MiniMax using 3% more.
 - Prompt caching on supported models now reuses shared instructions across workspaces and worktrees.
 - Changing branches or permissions, reading new folder rules, and resuming a conversation keep the earlier conversation available for prompt caching.
 - Named skills send their full instructions with the turn that invokes them instead of adding them to every later request.

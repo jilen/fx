@@ -55,6 +55,7 @@ const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const info_panel_presentation = @import("../../ui/footer/info_panel_presentation.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -990,6 +991,9 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (resolved == .cursor_left and try backMcpHostMenuScreen(app)) return .done;
+            if (resolved == .cursor_right and try enterMcpHostMenuItem(app)) return .done;
+
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
@@ -1308,6 +1312,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
+                    } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentEffortPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1384,6 +1390,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try submitEffortMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitMcpHostMenu(app)) return;
@@ -1754,6 +1761,50 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Whether the menu asks Remove or Reject on the choice's row, where
+        /// ← and → choose between yes and no.
+        fn mcpHostMenuAsksOnRow(app: *App) bool {
+            const menu_state = &app.mcp.host_menu;
+            if (menu_state.screen != .confirm) return false;
+            const c = menu_state.confirm orelse return false;
+            return c.asksOnRow();
+        }
+
+        /// ← goes back a screen, like Esc, from a server's screen or an
+        /// approval; on a question asked on its row it chooses yes. With a
+        /// filter typed it moves the composer's cursor, and on the list there
+        /// is nothing to go back to.
+        fn backMcpHostMenuScreen(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.left);
+                return true;
+            }
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            try app.mcpHostMenuKey(.escape);
+            return true;
+        }
+
+        /// → acts like Enter on the list and on a server's screen: it opens
+        /// the server or runs the selected choice. On a question asked on its
+        /// row it chooses no, and an approval still takes Enter, so → never
+        /// confirms by accident. With the cursor inside a typed filter, →
+        /// moves it instead.
+        fn enterMcpHostMenuItem(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.right);
+                return true;
+            }
+            if (app.mcp.host_menu.screen == .confirm) return false;
+            const edit = &app.input_runtime.edit_state;
+            if (edit.cursor != edit.input.items.len) return false;
+            try app.mcpHostMenuKey(.enter);
+            return true;
+        }
+
         /// On the list and on a server's screen, typing goes to the composer,
         /// which filters the servers or the server's tools. On a
         /// confirmation any printable byte means no, like `[y/N]`. Control
@@ -1781,12 +1832,14 @@ pub fn Runtime(comptime App: type) type {
 
         const CompactCommandMenuKind = enum {
             statusline,
+            info_panel,
             usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
+            if (app.input_runtime.info_panel.active) return .info_panel;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
             return null;
@@ -1929,9 +1982,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            // The fork menu reads no query from the composer, so an edit closes it.
+            // The fork and effort menus read no query from the composer, so
+            // an edit closes them.
             const fork_menu_closed = cancelForkMenu(app);
-            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed;
+            const effort_menu_closed = cancelEffortMenu(app);
+            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -2063,6 +2118,12 @@ pub fn Runtime(comptime App: type) type {
                 try prepareWorkspaceMenuCommand(app, max_input_len);
                 return;
             }
+            // The panel only shows; Enter closes it as Esc does.
+            if (menu == .info_panel) {
+                app.input_runtime.info_panel.close();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (menu == .usage) {
                 if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
                 return;
@@ -2070,7 +2131,7 @@ pub fn Runtime(comptime App: type) type {
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .usage, .workspace => unreachable,
+                .info_panel, .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2112,6 +2173,7 @@ pub fn Runtime(comptime App: type) type {
         fn moveCompactCommandMenu(app: *App, menu: CompactCommandMenuKind, delta: i32) bool {
             return switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
+                .info_panel => scrollInfoPanel(app, delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
                     usageMenuVisibleModelItems(app),
@@ -2124,6 +2186,18 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        /// ↑↓ in a read-only panel, over the lines the footer shows it.
+        fn scrollInfoPanel(app: *App, delta: i32) bool {
+            const cols = app.shell.layout.cols;
+            const projection = render_input.infoPanelProjection(&app.input_runtime.info_panel, cols, app.shell.layout.rows);
+            const visible_rows = info_panel_presentation.footerRows(projection, cols, app.shell.layout.rows);
+            return app.input_runtime.info_panel.scrollBy(
+                delta,
+                info_panel_presentation.lineCount(projection.rows, cols),
+                info_panel_presentation.visibleLineCount(visible_rows),
+            );
         }
 
         fn usageMenuVisibleModelItems(app: *App) u16 {
@@ -2175,7 +2249,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .usage, .workspace => unreachable,
+                    .info_panel, .usage, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2641,7 +2715,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -2688,7 +2762,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2744,6 +2818,10 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.statusline_menu.close();
                 return true;
             }
+            if (app.input_runtime.info_panel.active) {
+                app.input_runtime.info_panel.close();
+                return true;
+            }
             if (app.input_runtime.usage_menu.active) {
                 // Esc on a model's detail screen goes back to the tables.
                 if (app.input_runtime.usage_menu.closeDetail()) {
@@ -2785,6 +2863,22 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return false;
             if (!forkMenuActive(app)) return false;
             app.session_persistence.fork_menu.close(app.alloc);
+            return true;
+        }
+
+        fn cancelEffortMenu(app: *App) bool {
+            if (!app.input_runtime.effort_menu.active) return false;
+            app.input_runtime.effort_menu.close(app.alloc);
+            return true;
+        }
+
+        /// Applies the level highlighted in the `/effort` menu and closes it.
+        fn submitEffortMenuSelection(app: *App) !bool {
+            const menu = &app.input_runtime.effort_menu;
+            const effort = menu.selectedEffort() orelse return false;
+            menu.close(app.alloc);
+            try session_commands.Commands(App).selectEffort(app, effort);
+            app.shell.render_requests.request(.footer);
             return true;
         }
     };

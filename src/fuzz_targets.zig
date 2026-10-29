@@ -8,9 +8,12 @@ test {
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
+    _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
+    _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/session/session_adapter.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");

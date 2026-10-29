@@ -448,13 +448,16 @@ describe("/mcp in the shell", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("a config change never freezes the shell, and a server runs one copy at a time", async () => {
+  test.skipIf(!tmuxAvailable())("a config change restarts only the server it changed, never freezes the shell, and a server runs one copy at a time", async () => {
     // `s` keeps running after its input closes and ignores SIGTERM, so fx
     // takes about 3 s to stop it: 1.5 s for it to exit, 1.5 s after SIGTERM.
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
     const eofPath = join(root.home, "s.eof");
-    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath } }) } }));
+    const projPid = join(root.home, "proj.pid");
+    const env = { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath };
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env }) } }));
+    writeFileSync(root.projectPath, JSON.stringify({ mcpServers: { proj: fixtureServer({ env: { FX_MCP_PID_PATH: projPid } }) } }));
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -466,34 +469,53 @@ describe("/mcp in the shell", () => {
     // `s` outlives fx's SIGTERM at quit, so every copy is killed here.
     const pids = new Set<number>();
     const killServers = () => {
-      if (existsSync(pidPath)) pids.add(Number(readFileSync(pidPath, "utf8")));
+      for (const path of [pidPath, projPid]) if (existsSync(path)) pids.add(Number(readFileSync(path, "utf8")));
       for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
     };
+    const pidIn = (path: string) => (existsSync(path) ? Number(readFileSync(path, "utf8").trim() || "0") : 0);
     try {
       await tui.waitForComposer(15_000);
       // `s` starts on its own once the first frame is up and writes its pid.
-      // Nothing is wrong, so the status line says nothing about MCP.
       const upBy = Date.now() + 10_000;
-      while (!(existsSync(pidPath) && readFileSync(pidPath, "utf8").trim() !== "") && Date.now() < upBy) await Bun.sleep(5);
-      const oldPid = Number(readFileSync(pidPath, "utf8"));
+      while (pidIn(pidPath) === 0 && Date.now() < upBy) await Bun.sleep(5);
+      const oldPid = pidIn(pidPath);
       pids.add(oldPid);
 
+      // Adding a server, approving one, and removing one leave `s` as it was.
       await tui.sendText("/mcp add web https://w.example/mcp");
+      await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+      await tui.sendText("/mcp approve proj");
+      await tui.waitForText("Approved proj", 10_000);
+      const projBy = Date.now() + 10_000;
+      while (pidIn(projPid) === 0 && Date.now() < projBy) await Bun.sleep(5);
+      expect(pidIn(projPid)).not.toBe(0);
+      await tui.sendText("/mcp remove web");
+      await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
+      expect(pidIn(pidPath)).toBe(oldPid);
+      expect(existsSync(eofPath)).toBe(false);
+      expect(isRunning(oldPid)).toBe(true);
+
+      // Removed, `s` stops; added back at once, the new copy waits for it.
+      await tui.sendText("/mcp remove s");
+      await tui.waitForText("Removed s from ~/.fx/mcp.json.", 10_000);
       const eofBy = Date.now() + 10_000;
       // The fixture creates the file, then writes its pid.
       while (!(existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "") && Date.now() < eofBy) await Bun.sleep(5);
       expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
-      // The old host is stopping `s` now. Typing still shows at once.
+      const flags = Object.entries(env).map(([k, v]) => `--env ${k}=${v}`).join(" ");
+      await tui.sendText(`/mcp add ${flags} s -- ${process.execPath} ${MODERN_FIXTURE}`);
+      await tui.waitForText("Added s to ~/.fx/mcp.json.", 10_000);
+      // The old copy is still stopping. Typing still shows at once.
       const typedAt = Date.now();
       await tui.sendLiteral("zq");
       await tui.waitForText("zq", 5_000);
       expect(Date.now() - typedAt).toBeLessThan(1_000);
       expect(isRunning(oldPid)).toBe(true);
 
-      // The new host starts `s` only once the old copy is gone.
+      // The new copy starts only once the old one is gone.
       const startBy = Date.now() + 15_000;
-      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < startBy) await Bun.sleep(5);
-      expect(Number(readFileSync(pidPath, "utf8"))).not.toBe(oldPid);
+      while (pidIn(pidPath) === oldPid && Date.now() < startBy) await Bun.sleep(5);
+      expect(pidIn(pidPath)).not.toBe(oldPid);
       expect(isRunning(oldPid)).toBe(false);
       await tui.sendKeys("C-u");
       await tui.sendText("/mcp list");
@@ -506,8 +528,8 @@ describe("/mcp in the shell", () => {
     }
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("a config change while a server is in use lets it finish, and the server never runs twice", async () => {
-    // `s` takes 3 s to start, so `/mcp show s` holds the old host while the config changes.
+  test.skipIf(!tmuxAvailable())("a config change while a server is in use leaves it running, and the call finishes on the same process", async () => {
+    // `s` takes 3 s to start, so `/mcp show s` is waiting on it while the config changes.
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
     writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_DISCOVER_DELAY_MS: "3000", FX_MCP_PID_PATH: pidPath } }) } }));
@@ -533,15 +555,11 @@ describe("/mcp in the shell", () => {
       await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
       expect(await tui.capturePane()).not.toContain("Echo text through the modern MCP fixture");
 
-      // The moment a new copy starts, the old one must be gone.
-      const nextBy = Date.now() + 15_000;
-      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < nextBy) await Bun.sleep(5);
-      const oldAliveAtSwitch = isRunning(oldPid);
-      pids.add(Number(readFileSync(pidPath, "utf8")));
-      expect(pids.size).toBe(2);
-      expect(oldAliveAtSwitch).toBe(false);
-      // And the show finished on the old host.
+      // The show answers from the copy it was waiting on, which keeps running.
       await tui.waitForText("Echo text through the modern MCP fixture", 10_000);
+      pids.add(Number(readFileSync(pidPath, "utf8")));
+      expect([...pids]).toEqual([oldPid]);
+      expect(isRunning(oldPid)).toBe(true);
     } finally {
       await tui?.kill();
       tui = null;
@@ -564,7 +582,7 @@ describe("/mcp in the shell", () => {
     });
     // Not a prompt: the composer is free, and the status line says what's waiting.
     await tui.waitForComposer(15_000);
-    await tui.waitForText("2 MCP servers need you · /mcp", 10_000);
+    await tui.waitForText("2 MCP need attention · /mcp", 10_000);
     // One left, it's named; it stays until it's handled.
     await tui.sendText("/mcp reject broken");
     await tui.waitForText("proj is waiting for approval · /mcp", 10_000);
@@ -660,6 +678,11 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("MCP servers  3", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
+    // ← goes back to the list like Esc, and → opens the server like Enter.
+    await tui.sendKeys("Left");
+    await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
+    await tui.sendKeys("Right");
+    await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     expect(await tui.capturePane()).not.toContain("press ctrl+c again to exit");
@@ -678,33 +701,37 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(await tui.capturePane()).not.toContain("Approved proj");
 
-    // Confirmed, it runs `/mcp approve proj`, which prints in the conversation.
+    // Confirmed, it runs `/mcp approve proj`. The menu shows the result, so
+    // the conversation doesn't repeat it.
     await tui.sendKeys("Enter");
     await tui.waitForText("enter confirm     esc cancel", 5_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Approved proj, which runs: node proj.js --port 4100", 10_000);
     // The reload follows, and the screen with it.
     await tui.waitForText("› Reject        /mcp reject proj", 10_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Approved proj");
 
     // Remove asks which file it edits; Esc keeps the server, Enter removes it.
     await tui.sendKeys("Escape");
     await tui.waitForText("MCP servers  3", 5_000);
-    await tui.sendKeys("Up Enter");
+    // Approved, proj works and sorts between fixture and web.
+    await tui.sendKeys("Down Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
-    // It asks in the hint line; the server's screen stays as it was.
-    await tui.waitForText("Remove web from ~/.fx/mcp.json?     enter yes     esc no", 5_000);
-    expect(await tui.capturePane()).toContain("› Remove        /mcp remove web");
-    await tui.sendKeys("Escape");
+    // It asks on Remove's own row, with its answers; the hint line stays.
+    await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
+    expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
+    // → chooses no, and Enter on no keeps the server.
+    await tui.sendKeys("Right Enter");
+    await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
     await tui.sendKeys("Enter");
     await tui.waitForText("Remove web from ~/.fx/mcp.json?", 5_000);
     await tui.sendKeys("Enter");
-    await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
-    // Its screen goes with it, back to the list.
+    // Its screen goes with it, back to the list, which no longer shows it.
     await tui.waitForText("MCP servers  2", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
+    expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
 });
 

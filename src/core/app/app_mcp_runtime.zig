@@ -68,6 +68,16 @@ pub const State = struct {
     host_status_buf: [120]u8 = undefined,
     host_status_len: usize = 0,
     host_status_at_ms: i64 = 0,
+    /// When the host loaded or `startHostServers` last started its servers;
+    /// the status line waits for them to finish starting from then.
+    host_started_ms: i64 = 0,
+    /// Once the user sends a prompt, the servers that needed attention then:
+    /// the status line stops repeating them and names only new ones.
+    /// Null until the first prompt.
+    host_status_seen: ?mcp_menu.Seen = null,
+    /// A prompt was sent: record what needs attention once servers finish
+    /// starting.
+    host_status_dismiss_requested: bool = false,
     host_menu_tools_arena: ?std.heap.ArenaAllocator = null,
     /// Counts tool loads, so one for a server no longer open is dropped.
     host_menu_load: usize = 0,
@@ -108,12 +118,18 @@ pub const State = struct {
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
-    /// Loads the config again after `/mcp` changed it; calls still using the
-    /// old host finish on it.
+    /// Loads the config again after `/mcp` changed it. The host takes it in
+    /// place, so only a server whose config changed restarts. A new host
+    /// comes only when there was none, or the last server went; calls still
+    /// using an old one finish on it.
     pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true }));
+        const lease = self.leaseHost();
+        defer if (lease) |l| l.deinit();
+        const current = if (lease) |l| l.host else null;
+        const next = try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true, .reuse = current });
+        if (next != current) self.replaceHost(next);
         self.startHostServers();
     }
 
@@ -153,7 +169,31 @@ pub const State = struct {
         else
             null;
         sink.mutex.unlock(io_mod.getIo());
+        // While servers start, what needs the user waits so the count shows
+        // once, not climbing; sign-in news still shows at once.
+        if (self.host_started_ms != 0 and !mcp_menu.startupSettled(statuses, now_ms - self.host_started_ms))
+            return mcp_menu.statusLine(buf, &.{}, signing_in, news, 0);
+        if (self.host_status_dismiss_requested) {
+            var seen: mcp_menu.Seen = .{};
+            seen.record(statuses);
+            self.host_status_seen = seen;
+            self.host_status_dismiss_requested = false;
+        }
+        // After a prompt, what the user already saw stays in /mcp.
+        if (self.host_status_seen) |*seen| {
+            const fresh = a.alloc(std.meta.Elem(@TypeOf(statuses)), statuses.len) catch return "";
+            return mcp_menu.statusLine(buf, mcp_menu.unseen(statuses, seen, fresh), signing_in, news, 0);
+        }
         return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
+    }
+
+    /// The user sent a prompt: what needs attention has been seen, so the
+    /// status line clears it and speaks up only about new problems. Servers
+    /// still starting are recorded once they finish.
+    pub fn dismissHostStatus(self: *State) void {
+        self.host_status_dismiss_requested = true;
+        // The next refresh shows the change instead of waiting its turn.
+        self.host_status_at_ms = 0;
     }
 
     /// Starts every server in the background, so each is ready before it's
@@ -162,8 +202,9 @@ pub const State = struct {
     pub fn startHostServers(self: *State) void {
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
-        for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
-            debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
+        self.host_started_ms = io_mod.milliTimestamp();
+        for (lease.host.runtime.servers()) |s| lease.host.runtime.prepare(s.name) catch |err| {
+            debug_trace.logf("mcp", "MCP servers not started in the background server={s} err={s}", .{ s.name, @errorName(err) });
             return;
         };
     }
@@ -226,6 +267,8 @@ pub const State = struct {
             break :unused h.leases == 0;
         } else false;
         self.host_mutex.unlock(io_mod.getIo());
+        // Its servers haven't reported in yet: the status line waits for them.
+        if (next != null) self.host_started_ms = io_mod.milliTimestamp();
         if (unused) old.?.stop();
     }
 
@@ -304,10 +347,9 @@ pub const State = struct {
             switch (notice) {
                 .authorize => |n| {
                     sink.waitForSignIn(n.server, n.url);
-                    // The menu shows the address; a typed login prints it.
+                    // The menu shows the address; a typed login links it.
                     if (!sink.isTyped(n.server)) return;
-                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
-                    sink.pushLocked(text, false);
+                    sink.pushLocked(signInText(a, aa, n.server, n.url) catch return, false);
                 },
                 .signed_in => |server| {
                     sink.endSignIn(server);
@@ -393,6 +435,16 @@ pub const State = struct {
 
         fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
             return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
+        }
+
+        /// What a typed login says once its address comes, owned by `alloc`:
+        /// a link to it, or, when it can't be a link target, the address
+        /// itself made safe, to copy.
+        fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
+            const name = safeText(arena, server, 160);
+            if (text_utils.isLinkTarget(url))
+                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
+            return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
 
@@ -487,16 +539,21 @@ pub const State = struct {
             defer arena.deinit();
             if (try typedLoginServer(arena.allocator(), args)) |server| sink.markTyped(server);
         }
-        try self.startVerbs(home, workspace_root, args);
+        try self.startVerbs(home, workspace_root, args, .transcript);
     }
 
+    /// Where a `/mcp` command's report goes. A command typed in the
+    /// composer prints it; a choice in the menu shows its result there, so
+    /// only its warnings and errors print.
+    const VerbReport = enum { transcript, warnings_only };
+
     /// Runs `/mcp` with `args` off the UI thread, like `runVerbs`.
-    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8) !void {
+    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
         if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         const a = std.heap.c_allocator;
         const job = try a.create(VerbJob);
         errdefer a.destroy(job);
-        job.* = .{ .state = self };
+        job.* = .{ .state = self, .report = report };
         errdefer job.free();
         const owned = try a.alloc([]const u8, args.len);
         @memset(owned, "");
@@ -512,6 +569,7 @@ pub const State = struct {
 
     const VerbJob = struct {
         state: *State,
+        report: VerbReport,
         args: []const []const u8 = &.{},
         home: []const u8 = "",
         workspace_root: []const u8 = "",
@@ -549,6 +607,7 @@ pub const State = struct {
             }, args);
             const sink = self.host_sink orelse return;
             for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |w, warning| {
+                if (!warning and job.report == .warnings_only) continue;
                 const text = std.mem.trimEnd(u8, w.written(), "\n");
                 if (text.len == 0) continue;
                 sink.push(a.dupe(u8, text) catch continue, warning);
@@ -650,7 +709,7 @@ pub const State = struct {
             .run => |run| {
                 // A confirmed Remove went back to the list already.
                 if (self.host_menu.screen == .list) self.stopMenuTools();
-                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server });
+                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server }, .warnings_only);
                 // The status follows sooner than the next refresh would show it.
                 self.host_menu_at_ms = 0;
             },
@@ -1116,6 +1175,18 @@ test "model catalog baseline reports removals" {
     try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
 }
 
+test "a typed sign-in prints an address that can't be a link, to copy" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    const text = sink.notices.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+}
+
 test "a typed sign-in reports in the transcript, any other on the status line" {
     var sink: State.HostSink = .{};
     defer sink.deinit();
@@ -1124,6 +1195,11 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     notify.notice(notify.context, .{ .signed_in = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    // The address is a link under a few words, not printed out.
+    try std.testing.expectEqualStrings(
+        "Sign in to docs in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
+        sink.notices.items[0].text,
+    );
     try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
     // Once reported, the next sign-in to it isn't typed.

@@ -311,6 +311,46 @@ function outerQuestionBatchCall() {
   ]);
 }
 
+const FULL_QUESTION_BATCH = 20;
+const QUESTION_COUNT_REJECTION =
+  `(ask_user_question: provide 1 to ${FULL_QUESTION_BATCH} questions)`;
+
+function batchQuestionText(index: number) {
+  return `Batch decision ${String(index + 1).padStart(2, "0")}?`;
+}
+
+function batchQuestions(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    question: batchQuestionText(index),
+    options: [
+      { label: `Keep ${index + 1}`, description: "Leave this setting as it is." },
+      { label: `Change ${index + 1}`, description: "Apply the proposed change." },
+    ],
+  }));
+}
+
+function outerBatchQuestionCall(id: string, count: number) {
+  return outerToolCalls([
+    { id, name: "ask_user_question", input: { questions: batchQuestions(count) } },
+  ]);
+}
+
+function toolResultText(body: string, callId: string): string {
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content: unknown }> }).prompt;
+  for (const message of prompt) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part.type !== "tool-result" || part.toolCallId !== callId) continue;
+      const output = part.output as { value?: unknown } | undefined;
+      if (typeof output?.value !== "string") {
+        throw new Error(`Tool result ${callId} has no text output`);
+      }
+      return output.value;
+    }
+  }
+  throw new Error(`Missing tool result for ${callId}`);
+}
+
 function outerLongQuestionAnswerCall() {
   return outerToolCalls([
     {
@@ -1453,7 +1493,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("Permission needed", TIMEOUT);
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
       expect(cancelled).not.toContain(APPROVAL_PROMPT);
 
       await ctx.session.resizeWindow(72, 20);
@@ -2488,19 +2528,111 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "a full 20-question batch opens as one prompt, survives navigation and resize, and returns every answer in order",
+    async () => {
+      const finalMarker = "full question batch handled";
+      const ctx = await launchScenario([
+        outerBatchQuestionCall("question_batch_oversized", FULL_QUESTION_BATCH + 1),
+        outerBatchQuestionCall("question_batch_full", FULL_QUESTION_BATCH),
+        outerText(finalMarker),
+      ]);
+      const waitForPage = (page: number) =>
+        waitForPaneState(
+          ctx.session,
+          `full batch page ${page} of ${FULL_QUESTION_BATCH}`,
+          (value) =>
+            value.includes(batchQuestionText(page - 1)) &&
+            value.includes(`Question ${page} of ${FULL_QUESTION_BATCH}`),
+          TIMEOUT,
+        );
+
+      await ctx.session.sendText("Ask every setup decision at once.");
+      await waitForPage(1);
+
+      // The model is offered the full batch size, and one more question is
+      // rejected without opening a prompt.
+      const tools = (JSON.parse(ctx.gateway.requests[0]!.body) as {
+        tools: Array<{ name: string; description: string; inputSchema: any }>;
+      }).tools;
+      const askTool = tools.find((tool) => tool.name === "ask_user_question");
+      expect(askTool?.inputSchema.properties.questions.maxItems).toBe(FULL_QUESTION_BATCH);
+      expect(askTool?.description).toStartWith(`Ask the user 1-${FULL_QUESTION_BATCH} `);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(toolResultText(ctx.gateway.requests[1]!.body, "question_batch_oversized"))
+        .toBe(QUESTION_COUNT_REJECTION);
+
+      // Bursts of tab keys land on the right page and wrap past the last one.
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+
+      // A narrow terminal keeps the current page, and the counter returns
+      // once the hint row has room again.
+      await ctx.session.resizeWindow(48, 24);
+      await waitForPaneState(
+        ctx.session,
+        "narrow full batch page",
+        (value) => value.includes(batchQuestionText(13)) && value.includes("Change 14"),
+        TIMEOUT,
+      );
+      await ctx.session.resizeWindow(120, 40);
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+
+      // One burst answers every page: even pages keep, odd pages change.
+      const choices = Array.from({ length: FULL_QUESTION_BATCH }, (_, index) =>
+        index % 2 === 0 ? "1" : "2"
+      );
+      await ctx.session.sendLiteralText(choices.join(""));
+      await ctx.session.waitForText(finalMarker, TIMEOUT);
+
+      expect(ctx.gateway.requests).toHaveLength(3);
+      const answers = JSON.parse(
+        toolResultText(ctx.gateway.requests[2]!.body, "question_batch_full"),
+      ) as Array<{ question: string; answer: string }>;
+      expect(answers).toEqual(
+        Array.from({ length: FULL_QUESTION_BATCH }, (_, index) => ({
+          question: batchQuestionText(index),
+          answer: `${index % 2 === 0 ? "Keep" : "Change"} ${index + 1}`,
+        })),
+      );
+
+      // The transcript lists every answer once, hanging under its numbered
+      // question even after the number grows to two digits.
+      const scrollback = await ctx.session.captureFullScrollback();
+      expect(scrollback).not.toContain(`of ${FULL_QUESTION_BATCH + 1}`);
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      for (let index = 0; index < FULL_QUESTION_BATCH; index += 1) {
+        const prefix = `  ${index + 1}) `;
+        const resolution = `${prefix}${batchQuestionText(index)}`;
+        expect(lines.filter((line) => line === resolution)).toHaveLength(1);
+        expect(lines[lines.indexOf(resolution) + 1]).toBe(
+          `${" ".repeat(prefix.length)}${answers[index]!.answer}`,
+        );
+      }
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "raw Escape cancels a question turn before a new prompt",
     async () => {
       const nextPrompt = "Start a new turn after raw question cancellation.";
       const ctx = await openQuestionPrompt("raw question cancellation completed");
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("raw question cancellation completed");
       const cancelledGrid = await ctx.session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -2554,13 +2686,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         (grid) => {
           const footer = findFooterBlocks(grid).at(-1);
           return (
-            grid.some((row) => row.includes("■ Cancelled")) &&
+            grid.some((row) => row.includes("▪ Cancelled")) &&
             footer?.bottomDivider === grid.length - 2
           );
         },
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(cancelledFooter).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(cancelledFooter!.topDivider);
@@ -2584,7 +2716,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
-      expect(countOccurrences(editedGrid.join("\n"), "■ Cancelled")).toBe(1);
+      expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -2599,8 +2731,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("kitty question cancellation completed");
 
       await ctx.session.sendHexBytes(CSI_U_ESCAPE);
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("kitty question cancellation completed");
 

@@ -80,15 +80,20 @@ fn isUnsupportedAutoControlOperator(token: command_lex.ArgvToken) bool {
 }
 
 /// `tokens` without a trailing unquoted `2>&1`, the one redirection a
-/// review-free stage may end with.
+/// review-free stage may end with. The shell reads `2` as a file descriptor
+/// only when it is written bare and touches `>&`: `\2>&1` and `2 >&1` pass
+/// `2` to the command and redirect standard output instead.
 fn withoutStderrToStdout(tokens: []const command_lex.ArgvToken) []const command_lex.ArgvToken {
-    if (tokens.len >= 3 and
-        !tokens[tokens.len - 3].quoted and
-        !tokens[tokens.len - 2].quoted and
-        !tokens[tokens.len - 1].quoted and
-        std.mem.eql(u8, tokens[tokens.len - 3].value, "2") and
-        std.mem.eql(u8, tokens[tokens.len - 2].value, ">&") and
-        std.mem.eql(u8, tokens[tokens.len - 1].value, "1"))
+    if (tokens.len < 3) return tokens;
+    const descriptor = tokens[tokens.len - 3];
+    const operator = tokens[tokens.len - 2];
+    const target = tokens[tokens.len - 1];
+    if (std.mem.eql(u8, descriptor.raw, "2") and
+        descriptor.end == operator.start and
+        !operator.quoted and
+        !target.quoted and
+        std.mem.eql(u8, operator.value, ">&") and
+        std.mem.eql(u8, target.value, "1"))
     {
         return tokens[0 .. tokens.len - 3];
     }
@@ -189,12 +194,44 @@ const reversible_git_fetch_value_options = [_][]const u8{
 };
 
 fn reversibleGitFetch(words: []const command_lex.ArgvToken) bool {
+    var options_ended = false;
     for (words) |word| {
         const value = word.value;
-        // Everything after `--` names a repository or a refspec.
-        if (std.mem.eql(u8, value, "--")) return true;
-        if (value.len == 0 or value[0] != '-') continue;
-        if (!isReversibleGitFetchOption(value)) return false;
+        if (!options_ended and std.mem.eql(u8, value, "--")) {
+            // Everything after `--` names a repository or a refspec.
+            options_ended = true;
+            continue;
+        }
+        if (!options_ended and value.len > 0 and value[0] == '-') {
+            if (!isReversibleGitFetchOption(value)) return false;
+            continue;
+        }
+        if (namesGitRemoteHelper(value)) return false;
+    }
+    return true;
+}
+
+/// Transports git runs itself, case-insensitively. git sends any other
+/// `<scheme>://` URL to a `git-remote-<scheme>` program, and `http` and
+/// `https` to the ones in its own exec path, which it searches before `PATH`.
+const builtin_git_url_schemes = [_][]const u8{ "file", "git", "ssh", "git+ssh", "ssh+git", "http", "https" };
+
+/// Whether git hands this repository to a remote helper it may find on
+/// `PATH`: `<helper>::<address>`, or a URL whose scheme is not a built-in
+/// transport. git reads the helper's name the way `transport_get` does.
+fn namesGitRemoteHelper(value: []const u8) bool {
+    var end: usize = 0;
+    while (end < value.len) : (end += 1) {
+        const byte = value[end];
+        const special = byte == '+' or byte == '-' or byte == '.';
+        if (!std.ascii.isAlphanumeric(byte) and (end == 0 or !special)) break;
+    }
+    if (end == 0) return false;
+    const rest = value[end..];
+    if (std.mem.startsWith(u8, rest, "::")) return true;
+    if (!std.mem.startsWith(u8, rest, "://")) return false;
+    for (builtin_git_url_schemes) |scheme| {
+        if (std.ascii.eqlIgnoreCase(value[0..end], scheme)) return false;
     }
     return true;
 }
@@ -269,6 +306,12 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch --depth=1 origin main",
         "git fetch --no-tags origin +main:main",
         "git fetch origin -- --not-an-option",
+        "git fetch https://github.com/vercel-labs/fx main",
+        "git fetch HTTPS://github.com/vercel-labs/fx",
+        "git fetch ssh://git@github.com/vercel-labs/fx.git",
+        "git fetch git@github.com:vercel-labs/fx.git",
+        "git fetch file:///tmp/repository",
+        "git fetch ../other main",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -306,11 +349,29 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch '--upload-pack=x' .",
         // A filter turns a full clone into a partial clone.
         "git fetch --filter=blob:none origin",
+        // git runs a `git-remote-<helper>` program, which it may find on
+        // `PATH`, for these repositories, also after `--`.
+        "git fetch probe::x",
+        "git fetch ext::sh",
+        "git fetch 'probe.v2+x::y' main",
+        "git fetch -- probe::x",
+        "git fetch origin -- probe::x",
+        "git fetch --multiple origin probe::x",
+        "git fetch probe://host/repository",
+        "git fetch PROBE://host/repository",
+        "git fetch ftp://host/repository",
         // zsh's `extendedglob` expands these to workspace file names.
         "git fetch ^nomatch .",
         "git fetch --prun#e",
         "npm install react@^18",
         "npm test x##",
+        // The shell reads `2` as a file descriptor only when it is bare and
+        // touches `>&`. Each of these passes `2` to git as an argument and
+        // redirects standard output.
+        "git status \\2>&1",
+        "git status\t\\2>&1",
+        "git status 2 >&1",
+        "git status '2'>&1",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
@@ -2296,6 +2357,7 @@ const parity_review_free_commands = [_][]const u8{
     "git fetch --all --tags",
     "git fetch --depth=1 origin main",
     "git fetch -q origin -- main",
+    "git fetch https://example.com/repository main",
     "npm install",
     "npm i",
     "npm ci",

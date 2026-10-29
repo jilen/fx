@@ -26,7 +26,7 @@ pub const Phase = core.Phase;
 pub const Handle = core.Handle;
 
 pub const Transport = union(enum) {
-    /// `environ_map` is the host's and must outlive the engine; `cwd` is
+    /// The engine keeps its own copy of `environ_map`; `cwd` is
     /// where the server starts, the host's own directory when null.
     stdio: struct { argv: []const []const u8, environ_map: ?*const std.process.Environ.Map = null, cwd: ?[]const u8 = null },
     http: struct { url: []const u8, headers: []const std.http.Header = &.{} },
@@ -61,7 +61,8 @@ pub const Event = struct {
         phase: Phase,
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
-        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+        /// `oversized`: a lost call's answer was over the message limit.
+        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.
         progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
@@ -184,6 +185,19 @@ pub const Engine = struct {
         e.slots = kept;
     }
 
+    /// Whether `reload` keeps a server with exactly this config running.
+    pub fn keeps(e: *const Engine, c: Config) bool {
+        for (e.slots.items) |slot| if (same(slot.config, c)) return true;
+        return false;
+    }
+
+    /// Whether a server `reload` dropped under this name isn't gone yet, so a
+    /// new one of that name would run beside it.
+    pub fn stopping(e: *const Engine, name: []const u8) bool {
+        for (e.retired.items) |slot| if (std.mem.eql(u8, slot.config.name, name)) return true;
+        return false;
+    }
+
     pub fn len(e: *const Engine) usize {
         return e.slots.items.len;
     }
@@ -255,6 +269,12 @@ pub const Engine = struct {
         return handle;
     }
 
+    /// Whether call `handle` went to its server, so it may have run there.
+    pub fn callSent(e: *Engine, handle: Handle) bool {
+        const slot, const i = e.findCall(handle) orelse return false;
+        return slot.calls.items[i].sent != null;
+    }
+
     /// Cancels a call: one waiting ends here, one in flight goes to its server.
     pub fn cancel(e: *Engine, handle: Handle) Error!void {
         const slot, const i = e.findCall(handle) orelse return;
@@ -295,10 +315,15 @@ pub const Engine = struct {
     /// a sign-in, and starts the server; false when the server can't
     /// use it, so it is still signed out and nothing starts.
     pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
-        const slot = try e.find(name);
-        if (!try (try e.ensureServer(slot)).useCredential(saved)) return false;
-        try e.step(slot, .need);
+        if (!try e.adoptCredential(name, saved)) return false;
+        try e.step(try e.find(name), .need);
         return true;
+    }
+
+    /// `useCredential` without starting the server, so a sign-out that
+    /// follows revokes that credential and nothing is sent with it first.
+    pub fn adoptCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
+        return (try e.ensureServer(try e.find(name))).useCredential(saved);
     }
 
     /// Sends the refresh server `name` said was due.
@@ -446,6 +471,7 @@ pub const Engine = struct {
                     .maybe_ran = c.maybe_ran,
                     .timed_out = c.timed_out,
                     .answer = c.answer,
+                    .oversized = c.oversized,
                 } });
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {
@@ -567,7 +593,7 @@ pub const Engine = struct {
         slot.config = .{
             .name = try a.dupe(u8, c.name),
             .transport = switch (c.transport) {
-                .stdio => |p| .{ .stdio = .{ .argv = try dupeAll(a, p.argv), .environ_map = p.environ_map, .cwd = if (p.cwd) |dir| try a.dupe(u8, dir) else null } },
+                .stdio => |p| .{ .stdio = .{ .argv = try dupeAll(a, p.argv), .environ_map = if (p.environ_map) |m| try cloneEnv(a, m) else null, .cwd = if (p.cwd) |dir| try a.dupe(u8, dir) else null } },
                 .http => |h| blk: {
                     const headers = try a.alloc(std.http.Header, h.headers.len);
                     for (h.headers, headers) |from, *to| to.* = .{ .name = try a.dupe(u8, from.name), .value = try a.dupe(u8, from.value) };
@@ -636,12 +662,31 @@ fn dupeAll(a: std.mem.Allocator, items: []const []const u8) ![]const []const u8 
     return copies;
 }
 
+fn cloneEnv(a: std.mem.Allocator, m: *const std.process.Environ.Map) std.mem.Allocator.Error!*const std.process.Environ.Map {
+    const copy = try a.create(std.process.Environ.Map);
+    copy.* = try m.clone(a);
+    return copy;
+}
+
+/// The same variables with the same values, whichever map holds them.
+fn sameEnv(a: ?*const std.process.Environ.Map, b: ?*const std.process.Environ.Map) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    if (x.count() != y.count()) return false;
+    var it = x.iterator();
+    while (it.next()) |entry| {
+        const value = y.get(entry.key_ptr.*) orelse return false;
+        if (!std.mem.eql(u8, entry.value_ptr.*, value)) return false;
+    }
+    return true;
+}
+
 fn same(a: Config, b: Config) bool {
     if (!std.mem.eql(u8, a.name, b.name) or std.meta.activeTag(a.transport) != std.meta.activeTag(b.transport)) return false;
     switch (a.transport) {
         .stdio => |p| {
             const q = b.transport.stdio;
-            if (p.environ_map != q.environ_map or p.argv.len != q.argv.len) return false;
+            if (!sameEnv(p.environ_map, q.environ_map) or p.argv.len != q.argv.len) return false;
             if (!std.mem.eql(u8, p.cwd orelse "", q.cwd orelse "") or (p.cwd == null) != (q.cwd == null)) return false;
             for (p.argv, q.argv) |x, y| if (!std.mem.eql(u8, x, y)) return false;
         },
@@ -745,6 +790,33 @@ test "a saved credential the server can't use starts nothing, and the host hears
     try std.testing.expect(!try e.useCredential("web", "not json"));
     try std.testing.expect(!try e.useCredential("web", "{\"access\":\"w1\"}"));
     try std.testing.expectEqual(before, e.status(0).phase);
+}
+
+test "a stdio server's environment counts by its variables, not the map that holds them" {
+    const gpa = std.testing.allocator;
+    var first: std.process.Environ.Map = .init(gpa);
+    defer first.deinit();
+    try first.put("MODE", "one");
+    var e: Engine = undefined;
+    try TestHost.start(&e);
+    defer e.deinit();
+    const argv = [_][]const u8{"/bin/cat"};
+    try e.reload(&.{.{ .name = "s", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = &first } } }});
+    // The engine has its own copy: the map it was given may go.
+    first.deinit();
+    first = .init(gpa);
+
+    var again: std.process.Environ.Map = .init(gpa);
+    defer again.deinit();
+    try again.put("MODE", "one");
+    try std.testing.expect(e.keeps(.{ .name = "s", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = &again } } }));
+    try again.put("MODE", "two");
+    try std.testing.expect(!e.keeps(.{ .name = "s", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = &again } } }));
+    try again.put("MODE", "one");
+    try again.put("EXTRA", "1");
+    try std.testing.expect(!e.keeps(.{ .name = "s", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = &again } } }));
+    try std.testing.expect(!e.keeps(.{ .name = "s", .transport = .{ .stdio = .{ .argv = &argv } } }));
+    try std.testing.expectEqualStrings("one", e.slots.items[0].config.transport.stdio.environ_map.?.get("MODE").?);
 }
 
 test "a stdio server's directory is part of its config, so a new one restarts it" {

@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { readPermissionsPanel } from "./info-panel";
 import { logLines, rootSessionIds } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
@@ -686,6 +687,14 @@ describe("lean auto mode reliability", () => {
       const review = reviewerText(gateway.classifierRequests[0]!.body);
       expect(review).toContain("review_context_kind: contextual");
       expect(review).toContain("Inspect the local site only");
+      // No later request shares a review's prefix, so the default GPT-5.6
+      // reviewer is asked to write nothing to its prompt cache.
+      expect(
+        gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5.6-luna");
+      expect(
+        JSON.parse(gateway.classifierRequests[0]!.body).providerOptions,
+      ).toEqual({ openai: { promptCacheOptions: { mode: "explicit" } } });
       expect(existsSync(marker)).toBe(true);
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
@@ -1149,6 +1158,9 @@ describe("lean auto mode reliability", () => {
           cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
           // Every shell drops `#note` as a comment.
           cleanCommandCall("npm test #note", "comment_word"),
+          // Inside double quotes the shell keeps a backslash before `s`, so
+          // npm gets `te\st`, not `test`.
+          cleanCommandCall("npm \"te\\st\"", "double_quoted_backslash"),
           (body) => {
             expect(body).toContain("review_caution");
             return fakeGatewayFinalText("shell syntax stayed reviewed");
@@ -1158,6 +1170,7 @@ describe("lean auto mode reliability", () => {
           fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
           fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
           fakeGatewayPermissionDecision("caution", "comment_word_review"),
+          fakeGatewayPermissionDecision("caution", "double_quoted_backslash_review"),
         ],
       );
       const result = await runFx(
@@ -1173,7 +1186,7 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(4);
       expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
@@ -1216,6 +1229,87 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a trailing 2>&1 stays review free only when the shell reads 2 as a file descriptor",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const gateway = startGateway(
+        [
+          cleanCommandCall("git status 2>&1", "bare_descriptor"),
+          (body) => {
+            expect(toolResultText(body, "bare_descriptor")).toContain("\"exit_code\":0");
+            // The shell passes `2` to git as an argument for both of these.
+            return cleanCommandCall("git status \\2>&1", "escaped_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "escaped_descriptor", "execution-denied")).toContain("review_caution");
+            return cleanCommandCall("git status 2 >&1", "spaced_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "spaced_descriptor", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("descriptor forms checked");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "escaped_descriptor_review"),
+          fakeGatewayPermissionDecision("caution", "spaced_descriptor_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Check the repository status."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git fetch from a repository that names a remote helper remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "remote-helper-must-not-run");
+      const bin = installRecorder(root, "git-remote-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs `git-remote-probe` from `PATH` for each of these.
+          cleanCommandCall("git fetch probe::x", "helper_prefix"),
+          cleanCommandCall("git fetch -- probe::x", "helper_after_separator"),
+          cleanCommandCall("git fetch probe://host/repository", "helper_scheme"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("remote helpers stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "helper_prefix_review"),
+          fakeGatewayPermissionDecision("caution", "helper_after_separator_review"),
+          fakeGatewayPermissionDecision("caution", "helper_scheme_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
       expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
@@ -2418,12 +2512,8 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendKeys("1");
       await activeSession.waitForText("saved-session permission rule updated", TIMEOUT);
 
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules (1):", TIMEOUT);
-      const listed = await activeSession.captureFullScrollback();
-      const idMatch = listed.match(
-        /saved-session permission rules \(1\):\n\s*(\d+) deny/,
-      );
+      const listed = await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "1");
+      const idMatch = /^(\d+) deny /.exec(listed.items["Saved rules"]?.[0] ?? "");
       expect(idMatch).not.toBeNull();
       const ruleId = idMatch![1];
 
@@ -2437,8 +2527,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.waitForText("Revoke this saved-session permission rule?", TIMEOUT);
       await activeSession.sendKeys("1");
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules: none", TIMEOUT);
+      await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "none");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

@@ -153,7 +153,8 @@ pub const Incoming = union(enum) {
     dropped: struct { err: wire.DecodeError, line: []const u8 },
     /// The connection changed state. `lost` means the process is gone and
     /// requests in flight on it are lost (`transport_lost` in `core/request.zig`).
-    changed: struct { state: core.State, lost: bool },
+    /// `oversized` says fx killed it for a stdout line over `max_line`.
+    changed: struct { state: core.State, lost: bool, oversized: bool = false },
     /// `next` was given a timeout and it passed first.
     timeout,
 };
@@ -187,6 +188,11 @@ test "a masked prefix keeps whole UTF-8 sequences and shows control bytes as '?'
 /// Bytes of the stderr tail a failure quotes: its last `tail_lines` lines.
 pub const tail_max = 240;
 const tail_lines = 3;
+
+/// How long the exit watcher waits, once a process is gone, for its stderr
+/// reader to reach the end of the pipe. A child that keeps the pipe open
+/// delays the exit by this much and no more.
+const stderr_drain_ms = 250;
 
 fn exitOf(status: u32) ?Exit {
     if (std.c.W.IFEXITED(status)) return .{ .code = std.c.W.EXITSTATUS(status) };
@@ -271,6 +277,9 @@ pub const Process = struct {
     budget: Budget,
     /// Why the last start failed, for logs.
     spawn_error: ?SpawnError = null,
+    /// The current process is being killed because it wrote a stdout line
+    /// over `max_line`: the loss its exit reports is said to be that.
+    killed_oversized: bool = false,
     /// How the last process ended, once it has: set under `pid_lock` before
     /// `.exited` is posted. A status can be read before the owner takes that
     /// event, so read it with `exitStatus`.
@@ -283,6 +292,9 @@ pub const Process = struct {
     tail_len: [tail_lines]u8 = @splat(0),
     tail_next: u8 = 0,
     tail_count: u8 = 0,
+    /// The latest generation whose stderr reader has handled every line and
+    /// reached the end of its pipe.
+    stderr_done: std.atomic.Value(core.Generation) = .init(0),
     /// This process in `everyone.list`.
     node: std.DoublyLinkedList.Node = .{},
 
@@ -404,13 +416,19 @@ pub const Process = struct {
                 p.held = bytes;
                 return .{ .stderr = bytes };
             },
-            .oversized => |g| (try p.apply(.{ .oversized_line = g })).lost,
+            .oversized => |g| blk: {
+                const applied = try p.apply(.{ .oversized_line = g });
+                if (before == .running and p.conn.state == .killing) p.killed_oversized = true;
+                break :blk applied.lost;
+            },
             .exited => |g| (try p.apply(.{ .process_exited = g })).lost,
             .timer => |t| (try p.apply(.{ .timer_fired = t })).lost,
             // One from an earlier process is stale.
             .write_failed => |g| if (g == p.conn.generation) (try p.apply(.write_failed)).lost else false,
         };
-        if (lost or p.conn.state != before) return .{ .changed = .{ .state = p.conn.state, .lost = lost } };
+        const oversized = lost and p.killed_oversized;
+        if (lost) p.killed_oversized = false;
+        if (lost or p.conn.state != before) return .{ .changed = .{ .state = p.conn.state, .lost = lost, .oversized = oversized } };
         return null;
     }
 
@@ -436,6 +454,7 @@ pub const Process = struct {
             for (out.effects()) |effect| switch (effect) {
                 .spawn => |g| {
                     p.spawn_error = null;
+                    p.killed_oversized = false;
                     p.pid_lock.lockUncancelable(p.io);
                     p.exit = null;
                     p.pid_lock.unlock(p.io);
@@ -505,7 +524,7 @@ pub const Process = struct {
         errdefer p.stopSpawned(unread[0], unread[1]);
         try p.tasks.concurrent(p.io, readLines, .{ p, child.stdout.?, .{ .stdout = generation } });
         unread[0] = null;
-        try p.tasks.concurrent(p.io, readLines, .{ p, child.stderr.?, .stderr });
+        try p.tasks.concurrent(p.io, readLines, .{ p, child.stderr.?, .{ .stderr = generation } });
         unread[1] = null;
         try p.tasks.concurrent(p.io, watch, .{ p, generation, pid });
     }
@@ -610,12 +629,16 @@ pub const Process = struct {
 
     const Stream = union(enum) {
         stdout: core.Generation,
-        stderr,
+        stderr: core.Generation,
     };
 
     /// Reads lines from the server's stdout or stderr until the stream ends.
     fn readLines(p: *Process, file: std.Io.File, stream: Stream) std.Io.Cancelable!void {
         defer file.close(p.io);
+        // The exit watcher waits for this before it posts the exit.
+        defer if (stream == .stderr) {
+            _ = p.stderr_done.fetchMax(stream.stderr, .release);
+        };
         var buffer: [16 * 1024]u8 = undefined;
         var file_reader = file.reader(p.io, &buffer);
         const reader = &file_reader.interface;
@@ -674,8 +697,24 @@ pub const Process = struct {
                 p.pid = null;
             }
             p.pid_lock.unlock(p.io);
-            if (gone) return p.post(.{ .exited = generation });
+            if (gone) {
+                try p.awaitStderr(generation);
+                return p.post(.{ .exited = generation });
+            }
             try p.io.sleep(.fromMilliseconds(p.options.poll_ms), .awake);
+        }
+    }
+
+    /// Waits up to `stderr_drain_ms` for `generation`'s stderr reader to
+    /// finish. A server that exits at once can be reaped before that reader
+    /// runs, and its last lines, which explain the exit, would miss the log
+    /// sink, the tail a failure quotes, and the queue ahead of the exit.
+    fn awaitStderr(p: *Process, generation: core.Generation) std.Io.Cancelable!void {
+        const deadline = std.Io.Clock.awake.now(p.io).toMilliseconds() + stderr_drain_ms;
+        while (p.stderr_done.load(.acquire) < generation and
+            std.Io.Clock.awake.now(p.io).toMilliseconds() < deadline)
+        {
+            try p.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 
@@ -980,6 +1019,33 @@ test "an oversized line kills the server" {
     try testing.expect(p.conn.errored and !p.conn.term_sent);
 }
 
+test "the loss from killing a server for an oversized line says so, and an ordinary exit's doesn't" {
+    const big = shell("printf '%0100d\\n' 0; exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &big);
+    defer p.deinit();
+    try p.start();
+    const lost = for (0..200) |_| switch (try p.next(5_000)) {
+        .changed => |c| if (c.lost) break c,
+        .timeout => return error.TestTimeout,
+        else => {},
+    } else return error.TestUnexpectedResult;
+    try testing.expect(lost.oversized);
+    try testing.expect(!p.killed_oversized);
+
+    const quits = shell("exit 3");
+    var q: Process = undefined;
+    initTest(&q, &quits);
+    defer q.deinit();
+    try q.start();
+    const gone = for (0..200) |_| switch (try q.next(5_000)) {
+        .changed => |c| if (c.lost) break c,
+        .timeout => return error.TestTimeout,
+        else => {},
+    } else return error.TestUnexpectedResult;
+    try testing.expect(!gone.oversized);
+}
+
 test "stderr lines reach the host and never change the state" {
     const argv = shell("echo warming up >&2; exec cat >/dev/null");
     var p: Process = undefined;
@@ -988,6 +1054,62 @@ test "stderr lines reach the host and never change the state" {
     try p.start();
     try testing.expectEqualStrings("warming up", (try p.next(5_000)).stderr);
     try testing.expectEqual(core.State.running, p.conn.state);
+}
+
+/// A log sink that takes its time, as a reader whose thread runs only after
+/// a server that exits at once is already gone.
+const SlowSink = struct {
+    mutex: std.Io.Mutex = .init,
+    seen: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn line(context: *anyopaque, bytes: []const u8) void {
+        const s: *SlowSink = @ptrCast(@alignCast(context));
+        testing.io.sleep(.fromMilliseconds(40), .awake) catch {};
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        s.len = @min(bytes.len, s.seen.len);
+        @memcpy(s.seen[0..s.len], bytes[0..s.len]);
+    }
+
+    fn text(s: *SlowSink) []const u8 {
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        return s.seen[0..s.len];
+    }
+};
+
+test "a server's last stderr lines reach the sink and the tail before its exit does" {
+    const argv = shell("echo trace-me >&2; exit 3");
+    var sink: SlowSink = .{};
+    var p: Process = undefined;
+    p.init(testing.io, testing.allocator, .{
+        .argv = &argv,
+        .config = test_config,
+        .poll_ms = 5,
+        .max_line = 64,
+        .stderr = .{ .context = &sink, .line = SlowSink.line },
+    });
+    defer p.deinit();
+    try p.start();
+    try expectState(&p, .backoff);
+    try testing.expectEqualStrings("trace-me", sink.text());
+    var tail: [tail_max]u8 = undefined;
+    try testing.expectEqualStrings("trace-me", p.stderrTail(&tail));
+}
+
+test "a child that keeps stderr open delays a server's exit by at most stderr_drain_ms" {
+    // The background sleep inherits stderr, so the pipe outlives the server.
+    const argv = shell("sleep 30 & echo $! >&2; exit 3");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    const child = try std.fmt.parseInt(std.posix.pid_t, (try p.next(5_000)).stderr, 10);
+    defer std.posix.kill(child, .KILL) catch {};
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try expectState(&p, .backoff);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started < 2_000);
 }
 
 test "a stop signals the server's whole process group, so its children stop too" {

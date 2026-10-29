@@ -5180,6 +5180,12 @@ fn finishRecoveryStalled(
     consumed_attempts: usize,
     attempt_limit: usize,
     diagnostic: ?types.ModelFailureDiagnostic,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    partial_assistant: []const u8,
+    interrupted_persisted: *bool,
+    terminal_materializing: *bool,
+    trace_ctx: TraceContext,
 ) !void {
     try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
         deps,
@@ -5204,7 +5210,28 @@ fn finishRecoveryStalled(
             debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
         };
     }
-    try finalization.finish(.failed, null, null);
+    // The turn stops, but the work it already did stays in the conversation.
+    // Without it the next request has no record of the prompt or the completed
+    // tool steps, and the agent treats its own changes as someone else's.
+    if (try runtime_interruption.persistFailedTurnWorkOnce(
+        deps,
+        finalization,
+        job,
+        partial_assistant,
+        interrupted_persisted,
+        trace_ctx,
+        current_turn_messages,
+        terminal_materializing,
+    )) {
+        debug_trace.logf("agent", "stall stop kept the turn's completed work partial_bytes={d}", .{partial_assistant.len});
+    } else {
+        debug_trace.logf(
+            "agent",
+            "stall stop dropped a turn with no completed work partial_bytes={d}",
+            .{partial_assistant.len},
+        );
+        try finalization.finish(.failed, null, null);
+    }
     finish_trace.finish("recovery_stalled");
 }
 
@@ -8058,6 +8085,12 @@ fn processQueuedPromptLoop(
                         consumed_attempts,
                         semantic_limit,
                         failure_diagnostic,
+                        job,
+                        within_turn_suffix.items,
+                        stream_ctx.interruption_source_or(""),
+                        &interrupted_persisted,
+                        &stop_state.terminal_materializing,
+                        step_ctx,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
                     return;
@@ -8504,6 +8537,12 @@ fn processQueuedPromptLoop(
                         semantic_attempt + 1,
                         semantic_limit,
                         diagnostic,
+                        job,
+                        within_turn_suffix.items,
+                        stream_ctx.interruption_source_or(""),
+                        &interrupted_persisted,
+                        &stop_state.terminal_materializing,
+                        step_ctx,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
                     return;
@@ -8876,6 +8915,12 @@ fn processQueuedPromptLoop(
                         semantic_attempt + 1,
                         semantic_limit,
                         diagnostic,
+                        job,
+                        within_turn_suffix.items,
+                        partial_assistant,
+                        &interrupted_persisted,
+                        &stop_state.terminal_materializing,
+                        step_ctx,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
                     return;

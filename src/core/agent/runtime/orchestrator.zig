@@ -5181,12 +5181,16 @@ fn finishRecoveryStalled(
     attempt_limit: usize,
     diagnostic: ?types.ModelFailureDiagnostic,
     job: QueuedPrompt,
+    config: Config,
     current_turn_messages: []const ChatMessage,
     partial_assistant: []const u8,
     interrupted_persisted: *bool,
     terminal_materializing: *bool,
     trace_ctx: TraceContext,
 ) !void {
+    // The prompt goes back before the turn is saved, so a failed save cannot
+    // also lose it.
+    restorePromptAfterTerminalFailure(deps, job, config);
     try stream_ctx.provisional_statuses.finishUnmatchedRecoveryStarts(
         deps,
         stream_ctx.alloc,
@@ -5219,7 +5223,7 @@ fn finishRecoveryStalled(
     ) catch |err| {
         // Before saving starts, the caller's fallback commits the work and
         // that commit closes the checkpoint; a clear here would end it twice.
-        if (terminal_materializing.*) clearStalledRecoveryCheckpoint(deps);
+        if (terminal_materializing.*) clearRecoveryCheckpoint(deps, "stall stop");
         debug_trace.logf(
             "agent",
             "stall stop could not save the turn's completed work err={s} saving_started={s}",
@@ -5230,10 +5234,7 @@ fn finishRecoveryStalled(
     if (kept_work) {
         debug_trace.logf("agent", "stall stop kept the turn's completed work partial_bytes={d}", .{partial_assistant.len});
     } else {
-        // A stall-stopped turn is terminally dead: without clearing the durable
-        // checkpoint, the next resume would auto-continue it and re-spend
-        // attempts on a turn the UI already called stopped.
-        clearStalledRecoveryCheckpoint(deps);
+        clearRecoveryCheckpoint(deps, "stall stop");
         debug_trace.logf(
             "agent",
             "stall stop dropped a turn with no completed work partial_bytes={d}",
@@ -5242,13 +5243,6 @@ fn finishRecoveryStalled(
         try finalization.finish(.failed, null, null);
     }
     finish_trace.finish("recovery_stalled");
-}
-
-fn clearStalledRecoveryCheckpoint(deps: *const AgentRuntimeDeps) void {
-    const effect = deps.recovery_checkpoint orelse return;
-    effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
-    };
 }
 
 fn pushUnsafeNoRetryStatus(
@@ -5301,14 +5295,14 @@ fn restorePromptAfterTerminalFailure(
     };
 }
 
-// A user-cancelled turn's durable checkpoint dies with it; otherwise the next
-// resume would auto-continue a turn the user explicitly stopped. Covers the
-// model-response cancel paths, including a cancel during an episode's first
-// retry wait; no-ops when no checkpoint exists.
-fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
+// A cancelled or stall-stopped turn's durable checkpoint dies with it;
+// otherwise the next resume would auto-continue a turn that already stopped and
+// re-spend attempts on it. `why` names the stop in the trace. No-ops when no
+// checkpoint exists.
+fn clearRecoveryCheckpoint(deps: *const AgentRuntimeDeps, comptime why: []const u8) void {
     const effect = deps.recovery_checkpoint orelse return;
     effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
+        debug_trace.logf("agent", "recovery checkpoint clear on " ++ why ++ " failed err={s}", .{@errorName(err)});
     };
 }
 
@@ -7028,7 +7022,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
-            clearRecoveryCheckpointOnUserCancel(deps);
+            clearRecoveryCheckpoint(deps, "cancel");
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -8042,7 +8036,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    clearRecoveryCheckpointOnUserCancel(deps);
+                    clearRecoveryCheckpoint(deps, "cancel");
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -8091,9 +8085,6 @@ fn processQueuedPromptLoop(
                 }
                 if (recovery_decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    // The prompt goes back before the turn is saved, so a failed save
-                    // cannot also lose it.
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8105,6 +8096,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         failure_diagnostic,
                         job,
+                        config,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
                         &interrupted_persisted,
@@ -8545,9 +8537,6 @@ fn processQueuedPromptLoop(
                 }
                 if (decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    // The prompt goes back before the turn is saved, so a failed save
-                    // cannot also lose it.
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8559,6 +8548,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         diagnostic,
                         job,
+                        config,
                         within_turn_suffix.items,
                         stream_ctx.interruption_source_or(""),
                         &interrupted_persisted,
@@ -8657,7 +8647,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        clearRecoveryCheckpoint(deps, "cancel");
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8711,7 +8701,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
-                clearRecoveryCheckpointOnUserCancel(deps);
+                clearRecoveryCheckpoint(deps, "cancel");
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8925,9 +8915,6 @@ fn processQueuedPromptLoop(
                 }
                 if (decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    // The prompt goes back before the turn is saved, so a failed save
-                    // cannot also lose it.
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8939,6 +8926,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         diagnostic,
                         job,
+                        config,
                         within_turn_suffix.items,
                         partial_assistant,
                         &interrupted_persisted,
@@ -9040,7 +9028,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        clearRecoveryCheckpoint(deps, "cancel");
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;

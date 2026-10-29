@@ -1477,6 +1477,105 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a file's own terminal sequences and invalid bytes show as text in a resumed full diff",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-hostile-edit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.txt");
+    const resumedStderrPath = join(root, "resumed-stderr.txt");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+
+    // The edited line sits next to a screen clear, a C1 control, and bytes
+    // that are not UTF-8. Drawn raw, the first ended fx and the second
+    // reached the terminal; saved raw, the third failed the session save.
+    const original = Buffer.concat([
+      Buffer.from("keep\n\x1b[2J\x1b[Hclear-row\n\u009b31mcsi-row\n"),
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("-bytes-row\nedit-me\ntrailing-context\n"),
+    ]);
+    const target = join(workspace, "hostile.txt");
+    writeFileSync(target, original);
+    const edited = Buffer.from(original.toString("latin1").replace("edit-me", "edited-row"), "latin1");
+
+    const doneMarker = "HOSTILE_EDIT_DONE";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("edit_hostile_1", "edit_file", {
+        path: "hostile.txt",
+        old_string: "edit-me",
+        new_string: "edited-row",
+      }),
+      fakeGatewayFinalText(doneMarker),
+    ]);
+    const expectEscapedRows = (screen: string) => {
+      expect(screen).toContain("\\x1b[2J\\x1b[Hclear-row");
+      expect(screen).toContain("\\u{009b}31mcsi-row");
+      expect(screen).toContain("\\xff\\xfe-bytes-row");
+      expect(screen).toContain("edited-row");
+    };
+    let active: TmuxSession | null = null;
+    let resumedGateway: ReturnType<typeof startFakeGateway> | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Apply the edit.");
+      await waitForScrollback(active, doneMarker);
+      expect(readFileSync(target).equals(edited)).toBe(true);
+
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      await active.sendKeys("C-o");
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      resumedGateway = startFakeGateway([]);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume-last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForText(doneMarker, TIMEOUT);
+      await active.sendKeys("C-o");
+      expectEscapedRows(await active.waitForText("trailing-context", TIMEOUT));
+      expect(active.isPaneAlive()).toBe(true);
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      gateway.stop();
+      resumedGateway?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
   "resumed session labels shell interactions with their launch command",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-session-label-")));
@@ -5753,6 +5852,34 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     expect(await new Response(dev.stdout).text()).toContain(
       `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
     );
+  } finally {
+    release.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, UPGRADE_TIMEOUT);
+
+test("update runs the manual upgrade", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-update-alias-")));
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const installedFx = join(root, "fx");
+  const home = join(root, "home");
+  mkdirSync(home);
+  const release = startUpgradeServer(root, argvLogPath);
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  try {
+    const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const exitCode = await update.exited;
+    expect(exitCode).toBe(0);
+    expect(await new Response(update.stdout).text()).toContain(
+      "notes: https://fx.sh/changelog#v9.9.9",
+    );
+    expect(readFileSync(installedFx, "utf8")).toStartWith("#!/bin/sh");
   } finally {
     release.stop();
     rmSync(root, { recursive: true, force: true });

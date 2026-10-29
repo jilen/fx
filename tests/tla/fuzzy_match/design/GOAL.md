@@ -26,6 +26,10 @@ pub const Match = struct { tier: Tier, field: usize };
 /// null when `query` does not match. `fields` must not be empty.
 pub fn match(query: []const u8, fields: []const Field) ?Match;
 
+/// The most fields a ranked listing orders by: a ranked match's `field` is
+/// below it.
+pub const ranked_field_limit = 8;
+
 /// A ranked listing (R10) over a caller's base positions, without
 /// allocating. `Context` has `fn matchAt(self, position: usize) ?Match`.
 pub fn Ranking(comptime Context: type) type; // count, at, rankOf, iterator

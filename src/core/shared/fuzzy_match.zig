@@ -521,9 +521,10 @@ pub const LabelMatches = struct {
     }
 };
 
-/// Ranked listings order by field only among the first fields; every caller
-/// passes fewer.
-const ranked_field_limit = 8;
+/// The most fields a ranked listing orders by (R10): a ranked match's `field`
+/// must be below it, which `rankBucket` asserts. A caller that builds its
+/// fields in a fixed buffer sizes the buffer with this.
+pub const ranked_field_limit = 8;
 const rank_bucket_count = @typeInfo(Tier).@"enum".field_names.len * ranked_field_limit;
 
 comptime {

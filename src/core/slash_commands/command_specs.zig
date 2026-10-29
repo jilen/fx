@@ -504,9 +504,10 @@ const SlashCompletionMatch = struct {
     command: []const u8,
 };
 
-/// A ranked listing orders by field only among its first eight, so the `/`
-/// menu matches a command and at most seven aliases shown in completion.
-const completion_field_limit = 8;
+/// A ranked listing orders by field only below `ranked_field_limit`, so the
+/// `/` menu matches a command and at most that many less one of the aliases
+/// shown in completion.
+const completion_field_limit = fuzzy_match.ranked_field_limit;
 
 /// The names the `/` menu matches a command by: the command, then the
 /// aliases it shows in completion. The matched one is the one shown.

@@ -39,6 +39,9 @@ export const SKILL_QUERIES = [
 type Menu = { header: RegExp; rowsEnd: RegExp };
 const MODELS_MENU: Menu = { header: /^Models (\d+)\b/, rowsEnd: /^(Note:|Using |No models|─)/ };
 const SKILLS_MENU: Menu = { header: /^Skills (\d+)\b/, rowsEnd: /^(No skills|─)/ };
+// The `/` menu titles a list of commands alone `Commands` and one that mixes
+// in skills `Results`.
+const COMMANDS_MENU: Menu = { header: /^(?:Commands|Results) (\d+)\b/, rowsEnd: /^(No commands|─)/ };
 
 /// The count in a menu's header and the first word of each row under it.
 function readMenu(grid: string[], menu: Menu): { count: number; rows: string[] } | null {
@@ -79,6 +82,18 @@ async function settle(session: Session, menu: Menu, query: string, timeoutMs = 8
   throw new Error(`the menu did not settle on ${JSON.stringify(query)}:\n${grid.join("\n")}`);
 }
 
+/// Polls the screen until `ready` holds, so no step waits a guessed time.
+async function waitForGrid(session: Session, ready: (grid: string[]) => boolean, what: string, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  let grid: string[] = [];
+  while (Date.now() < deadline) {
+    grid = await session.capturePaneGrid();
+    if (ready(grid)) return grid;
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for ${what}:\n${grid.join("\n")}`);
+}
+
 export type MenuRun = { surface: string; query: string; count: number; rows: string[] };
 
 async function runMenu(session: Session, menu: Menu, open: () => Promise<void>, queries: string[], surface: string) {
@@ -94,7 +109,7 @@ async function runMenu(session: Session, menu: Menu, open: () => Promise<void>, 
     runs.push({ surface, query, ...seen });
   }
   await session.sendKeys("Escape");
-  await Bun.sleep(300);
+  await waitForGrid(session, (grid) => readMenu(grid, menu) === null, `the ${surface} menu to close`);
   await session.sendKeys("C-u");
   return { base: base.rows, runs };
 }
@@ -146,7 +161,11 @@ export async function binaryStage(dir: string): Promise<BinaryResult> {
     await session.waitForComposer(15000);
     const s = session;
     const models = await runMenu(s, MODELS_MENU, () => s.sendText("/model"), MODEL_QUERIES, "models");
-    const skills = await runMenu(s, SKILLS_MENU, async () => { await s.sendLiteralText("/sk"); await Bun.sleep(400); await s.sendKeys("Enter"); }, SKILL_QUERIES, "skills");
+    const skills = await runMenu(s, SKILLS_MENU, async () => {
+      await s.sendLiteralText("/sk");
+      await waitForGrid(s, (grid) => readMenu(grid, COMMANDS_MENU)?.rows[0] === "/skills", "the / menu to list /skills first");
+      await s.sendKeys("Enter");
+    }, SKILL_QUERIES, "skills");
 
     const surfaces = [
       // `modelIdMatch` in src/core/app/model_cache_runtime.zig: the full id,

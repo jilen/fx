@@ -81,11 +81,12 @@ function pieceData(folder: string, data: any): any {
   return data;
 }
 
-/// What the session log holds: the live turn's tool results (call id and
-/// stamp, in order) and the superseded markers.
-export function diskTurn(folder: string): { calls: string[]; stamps: number[]; superseded: number; ended: boolean } {
+/// What the session log holds: the live turn's tool results (call id, stamp,
+/// and when fx wrote the line, in order) and the superseded markers.
+export function diskTurn(folder: string): { calls: string[]; stamps: number[]; written: number[]; superseded: number; ended: boolean } {
   let calls: string[] = [];
   let stamps: number[] = [];
+  let written: number[] = [];
   let superseded = 0;
   let ended = false;
   for (const line of readFileSync(join(folder, "log.jsonl"), "utf8").split("\n")) {
@@ -97,13 +98,15 @@ export function diskTurn(folder: string): { calls: string[]; stamps: number[]; s
       superseded += 1;
       calls = [];
       stamps = [];
+      written = [];
     } else if (value.type === "tool_result") {
       const data = pieceData(folder, value.data);
       calls.push(String(data.call_id));
       stamps.push(Number(data.created_at_ms));
+      written.push(Number(value.ts));
     }
   }
-  return { calls, stamps, superseded, ended };
+  return { calls, stamps, written, superseded, ended };
 }
 
 export function diskObservation(folder: string): Observation {

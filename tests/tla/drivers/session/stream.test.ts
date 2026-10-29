@@ -8,8 +8,10 @@
 // a rebuild that changed nothing needs no parsing.
 //
 // The scenarios cover one result per step, parallel calls, failed calls,
-// output full of escapes and non-ASCII text, unchanged output, a turn that
-// compacts in the middle, and a long turn (FX_TLA_STRESS_STEPS, default 200).
+// output full of escapes and non-ASCII text, unchanged output, file writes
+// and edits, a turn that compacts in the middle, and a long turn
+// (FX_TLA_STRESS_STEPS, default 200). Every saved result's stamp must fall
+// between when the fixture sent its call and when fx wrote its line.
 // Random walks fuzz the binary along the model: FX_TLA_WALKS turns (default
 // 3) of FX_TLA_WALK_STEPS steps (default 10) from FX_TLA_SEED (default 1),
 // each step one to three calls of every kind above, and about one walk in
@@ -43,6 +45,11 @@ type Scenario = {
   /// The model's context window. A small one makes fx compact mid-turn,
   /// since the fixture reports a request's size as its input tokens.
   contextWindow?: number;
+  /// Past `steps`, the turn goes on until a request shrinks, which means fx
+  /// just compacted, and this many more steps follow it, up to `steps` more.
+  /// The final request then comes while the context is small, so no last cut
+  /// empties the live turn, however large each request is.
+  settle?: number;
   prepare(workspace: string): void;
   step(n: number, workspace: string): Call[];
 };
@@ -101,6 +108,18 @@ const scenarios: Scenario[] = [
     },
     step: () => [read("same.txt")],
   },
+  {
+    // A write or an edit is a committed file result, which enters the turn
+    // apart from every other tool result.
+    name: "files",
+    steps: 6,
+    prepare(workspace) {
+      writeFileSync(join(workspace, "notes.txt"), "line 0\n");
+    },
+    step: (n) => n % 2 === 1
+      ? [{ name: "write_file", input: { path: `new-${n}.txt`, content: `file ${n}\n` } }, read("notes.txt")]
+      : [{ name: "edit_file", input: { path: "notes.txt", old_string: `line ${n - 2}`, new_string: `line ${n}` } }],
+  },
 ];
 
 /// Large reads against a small window, so fx compacts in the middle of the turn.
@@ -108,6 +127,7 @@ const compaction: Scenario = {
   name: "compaction",
   steps: 80,
   contextWindow: 24_000,
+  settle: 2,
   prepare() {},
   step(n, workspace) {
     writeFileSync(join(workspace, "evidence.txt"), `${n} ${"y".repeat(8 * 1024)}\n`);
@@ -174,7 +194,8 @@ type Run = {
   stdout: string;
   stderr: string;
   result: any;
-  issued: Array<{ id: string; fails: boolean }>;
+  /// Each call the fixture issued, and when it sent it.
+  issued: Array<{ id: string; fails: boolean; at: number }>;
   /// Summary requests the fixture answered.
   summaries: number;
   /// At each model request: the decisions fx had traced and the calls the
@@ -208,6 +229,11 @@ async function runTurn(scenario: Scenario, bin: string, traced: boolean): Promis
   const issued: Run["issued"] = [];
   let requests = 0;
   let summaries = 0;
+  // Each step's request grows the last; one that shrank followed a
+  // compaction. `sinceCut` counts the steps after the last such cut past
+  // `steps`, or is null until one comes.
+  let lastTokens = 0;
+  let sinceCut: number | null = null;
   const progress: Run["progress"] = [];
   const tracePath = join(root, "session-trace.log");
   const server = Bun.serve({
@@ -233,12 +259,18 @@ async function runTurn(scenario: Scenario, bin: string, traced: boolean): Promis
         return sse([{ type: "text-delta", id: "summary", delta: `Summary ${summaries}: the files were read.` }], "stop", inputTokens);
       }
       requests += 1;
-      const calls = requests <= scenario.steps ? scenario.step(requests, workspace) : [];
+      if (sinceCut !== null) sinceCut += 1;
+      if (inputTokens < lastTokens && requests > scenario.steps) sinceCut = 0;
+      lastTokens = inputTokens;
+      const more = requests <= scenario.steps ||
+        (scenario.settle !== undefined && (sinceCut === null || sinceCut < scenario.settle) && requests <= 2 * scenario.steps);
+      const calls = more ? scenario.step(requests, workspace) : [];
       // Every rebuild then runs in a new millisecond, the costly case.
       await Bun.sleep(2);
+      const at = Date.now();
       const events: unknown[] = calls.map((call, index) => {
         const id = `call_${requests}_${index + 1}`;
-        issued.push({ id, fails: call.fails ?? false });
+        issued.push({ id, fails: call.fails ?? false, at });
         return { type: "tool-call", toolCallId: id, toolName: call.name, input: call.input };
       });
       if (calls.length === 0) events.push({ type: "text-delta", id: "answer", delta: DONE });
@@ -299,7 +331,20 @@ function expectFinishedTurn(run: Run) {
   expect(disk.ended).toBe(true);
   expect(disk.superseded).toBe(0);
   expect(disk.calls).toEqual(run.issued.map((call) => call.id));
-  for (const stamp of disk.stamps) expect(stamp).toBeGreaterThan(0);
+  expectStampsAreMadeTimes(run);
+}
+
+/// Each saved result's stamp is a time fx made it: after the fixture sent
+/// its call, and before fx wrote the result's line.
+function expectStampsAreMadeTimes(run: Run) {
+  const sent = new Map(run.issued.map((call) => [call.id, call.at]));
+  const disk = diskTurn(run.folder);
+  disk.calls.forEach((id, index) => {
+    const at = sent.get(id);
+    expect(at).toBeDefined();
+    expect({ id, stamp: disk.stamps[index]! >= at! }).toEqual({ id, stamp: true });
+    expect({ id, stamp: disk.stamps[index]! <= disk.written[index]! }).toEqual({ id, stamp: true });
+  });
 }
 
 /// What a turn's log holds, for comparing two binaries on the same turn.
@@ -437,7 +482,7 @@ test("a turn that compacts mid-turn supersedes only where a cut shifted it, and 
   const ids = run.issued.map((call) => call.id);
   expect(shape.calls.length).toBeGreaterThan(0);
   expect(ids.slice(ids.length - shape.calls.length)).toEqual(shape.calls);
-  for (const stamp of diskTurn(run.folder).stamps) expect(stamp).toBeGreaterThan(0);
+  expectStampsAreMadeTimes(run);
   const verdict = await checkTrace(observationsOf(run), ids, join(artifacts, "compaction-tlc"));
   expect({ verdict: verdict.verdict, detail: verdict.detail }).toMatchObject({ verdict: "ACCEPTED" });
   writeJson(join(artifacts, "compaction.json"), { cuts, mismatches, shape });
@@ -459,6 +504,7 @@ for (let walk = 1; walk <= WALKS; walk++) {
     expect(run.result?.final_output).toBe(DONE);
     // A compacting walk may lose the call that was running at a compaction.
     if (scenario.contextWindow === undefined) expectFinishedTurn(run);
+    else expectStampsAreMadeTimes(run);
     const observations = observationsOf(run);
     expect(observations.reduce((sum, o) => sum + o.reparsed, 0)).toBe(0);
     const verdict = await checkTrace(observations, run.issued.map((call) => call.id), join(artifacts, `${scenario.name}-tlc`));

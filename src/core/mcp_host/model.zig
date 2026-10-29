@@ -870,11 +870,19 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
         .denied => "fx's permission refused it",
         else => @tagName(e.outcome),
     };
-    const text = try arena.print("MCP server '{s}' ended the call: {s}{s}{s}", .{
+    // fx ended a call that ran out of time, so it says so and names the
+    // setting that waits longer. A server the editor supplied has none.
+    const text = if (e.timed_out) try arena.print(
+        "fx stopped waiting for MCP server '{s}': it did not answer within its operation timeout.{s}{s}",
+        .{
+            server,
+            if (e.maybe_ran) " The tool may have run." else "",
+            if (how == .editor) "" else " Raise operation_timeout_ms for this server in its MCP config if it needs longer.",
+        },
+    ) else try arena.print("MCP server '{s}' ended the call: {s}{s}.", .{
         server,
-        if (e.timed_out) "it did not answer in time" else e.why orelse why,
+        e.why orelse why,
         if (e.maybe_ran) ". The tool may have run" else "",
-        ".",
     });
     return .{ .model_output = try tool_result_limits.prepareModelOutput(arena, name, text, max_bytes), .status = .protocol_failure };
 }
@@ -1135,8 +1143,12 @@ test "a search says why a server it names has no tools, and calls that end say h
     try testing.expect(std.mem.find(u8, unrenewed.model_output, "may have run") == null);
     try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096, .terminal));
     // The engine ends a call that runs out of time as cancelled; the model
-    // hears the timeout, not a cancellation.
+    // hears that fx stopped waiting, and how to wait longer.
     const slow = try ended(a, "aside", "mcp_aside_repl", .{ .outcome = .cancelled, .maybe_ran = true, .timed_out = true }, 4096, .terminal);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, slow.status);
-    try testing.expect(std.mem.find(u8, slow.model_output, "MCP server 'aside' ended the call: it did not answer in time. The tool may have run.") != null);
+    try testing.expect(std.mem.find(u8, slow.model_output, "fx stopped waiting for MCP server 'aside': it did not answer within its operation timeout. The tool may have run. Raise operation_timeout_ms for this server in its MCP config if it needs longer.") != null);
+    // An editor's server has no timeout setting to raise.
+    const slow_in_editor = try ended(a, "aside", "mcp_aside_repl", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = true }, 4096, .editor);
+    try testing.expect(std.mem.find(u8, slow_in_editor.model_output, "fx stopped waiting for MCP server 'aside': it did not answer within its operation timeout.") != null);
+    try testing.expect(std.mem.find(u8, slow_in_editor.model_output, "operation_timeout_ms") == null);
 }

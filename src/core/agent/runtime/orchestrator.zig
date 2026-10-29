@@ -8756,28 +8756,6 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                if (decision.required_action == .surface_stall) {
-                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
-                    try finishRecoveryStalled(
-                        deps,
-                        finalization,
-                        &stream_ctx,
-                        arena,
-                        &finish_trace,
-                        cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
-                        diagnostic,
-                        job,
-                        config,
-                        within_turn_suffix.items,
-                        stream_ctx.interruption_source_or(""),
-                        &interrupted_persisted,
-                        &stop_state.terminal_materializing,
-                        step_ctx,
-                    );
-                    return;
-                }
                 if (decision.reserve_provider_attempt) {
                     if (route_changed) {
                         try persistRecoveryCheckpoint(

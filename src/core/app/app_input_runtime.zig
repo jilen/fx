@@ -9349,7 +9349,9 @@ test "app_input_runtime backslash enter is consumed by an active command skills 
     }};
     app.skills.items = @constCast(&skills);
     app.skills.openMenu();
-    try app.input_runtime.textReplacementState().replace(alloc, "\\");
+    // No skill matches the query, so the menu has nothing to pick and keeps
+    // Enter. A query of only `\` would match every skill.
+    try app.input_runtime.textReplacementState().replace(alloc, "zq\\");
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 

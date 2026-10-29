@@ -339,19 +339,16 @@ fn appendCompactFacts(
 ) !void {
     if (capabilities.context_window) |tokens| try appendTokenFact(alloc, facts, tokens, "context");
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
-    if (fastFact(capabilities)) |fact| try appendMetadataFact(alloc, facts, fact);
+    if (capabilities.intrinsic_fast) try appendMetadataFact(alloc, facts, fast_fact);
+    if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, fast_mode_fact);
     if (capabilities.supports_ultrafast_mode) try appendMetadataFact(alloc, facts, ultra_mode_fact);
 }
 
+// A `-fast` model always runs fast, so it reads "Fast". "Fast mode" and "Ultra mode"
+// name speed options the model offers, so they are not mistaken for a fast model.
+const fast_fact = "Fast";
+const fast_mode_fact = "Fast mode";
 const ultra_mode_fact = "Ultra mode";
-
-/// A `-fast` model always runs fast, so it reads "Fast". A model that only offers
-/// Fast mode as an option reads "Fast mode", so it is not mistaken for a fast model.
-fn fastFact(capabilities: model_capabilities.Capabilities) ?[]const u8 {
-    if (capabilities.intrinsic_fast) return "Fast";
-    if (capabilities.supports_fast_mode) return "Fast mode";
-    return null;
-}
 
 fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     var width: usize = 0;
@@ -363,9 +360,13 @@ fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += tokenFactWidth(tokens, "output");
     }
-    if (fastFact(capabilities)) |fact| {
+    if (capabilities.intrinsic_fast) {
         if (width > 0) width += display_width.visibleWidth(" · ");
-        width += display_width.visibleWidth(fact);
+        width += display_width.visibleWidth(fast_fact);
+    }
+    if (capabilities.supports_fast_mode) {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += display_width.visibleWidth(fast_mode_fact);
     }
     if (capabilities.supports_ultrafast_mode) {
         if (width > 0) width += display_width.visibleWidth(" · ");
@@ -872,7 +873,7 @@ test "model menu keeps only compact facts beside the model" {
     try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
 }
 
-test "model menu labels a -fast model Fast and a model with Fast mode as Fast mode" {
+test "model menu labels -fast models Fast and models that offer Fast mode as Fast mode" {
     const alloc = std.testing.allocator;
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{
@@ -889,6 +890,14 @@ test "model menu labels a -fast model Fast and a model with Fast mode as Fast mo
             .capabilities = model_capabilities.resolveCapabilities(
                 "anthropic/claude-opus-4.8-fast",
                 .{ .context_window = 1_000_000 },
+            ),
+        },
+        .{
+            .id = @constCast("xai/grok-4.7-fast"),
+            .provider = "xai",
+            .capabilities = model_capabilities.resolveCapabilities(
+                "xai/grok-4.7-fast",
+                .{ .supports_fast_mode = true, .context_window = 1_000_000 },
             ),
         },
     };
@@ -908,4 +917,9 @@ test "model menu labels a -fast model Fast and a model with Fast mode as Fast mo
     try std.testing.expect(std.mem.find(u8, always_fast.items, "anthropic/claude-opus-4.8-fast") != null);
     try std.testing.expect(std.mem.find(u8, always_fast.items, "1M context · Fast") != null);
     try std.testing.expect(std.mem.find(u8, always_fast.items, "Fast mode") == null);
+
+    var fast_with_option = try composeModelMenuRow(alloc, projection, 4, 100, rows);
+    defer fast_with_option.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "xai/grok-4.7-fast") != null);
+    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context · Fast · Fast mode") != null);
 }

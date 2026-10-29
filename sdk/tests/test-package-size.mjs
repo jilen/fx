@@ -8,6 +8,10 @@
 // build.zig): each one leaves out unwind tables, which a budget's headroom
 // would not catch, and keeps frame pointers, which Apple's ABI requires.
 //
+// It also checks that each native addon leaves out fx's built-in tools, which
+// libfx agents never run (builtin_tools in build.zig). Their code would add
+// about 0.8 MB to an addon, less than a budget's headroom.
+//
 //   node sdk/tests/test-package-size.mjs <libfx.tgz> --native-dir <dir> [--print]
 //
 // --print prints the measured sizes as budgets JSON instead of checking them.
@@ -68,6 +72,18 @@ function frameRecordSetups(addon, packageName) {
   return count;
 }
 const miscompiled = [];
+// Descriptions of three built-in tools. Each must still be in fx's source, so
+// the check can't pass only because a description was reworded.
+const toolSource = await readFile(new URL("../../src/builtins/tools.zig", import.meta.url), "utf8");
+const toolDescriptions = [
+  "Fetch bounded text from a known public HTTP(S) URL",
+  "Run every command with shell.run",
+  "Read a stored tool result or captured command output",
+];
+for (const text of toolDescriptions) {
+  assert.ok(toolSource.includes(text), `src/builtins/tools.zig no longer contains "${text}"; use another built-in tool's description`);
+}
+const withTools = [];
 for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   const platform = await measurePackage(path);
   measured[name] = { packed: platform.packed, unpacked: platform.unpacked };
@@ -76,9 +92,11 @@ for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   for (const section of ["eh_frame", "__unwind_info"]) if (addon.includes(section)) miscompiled.push(`${name}: has ${section}`);
   const frames = frameRecordSetups(addon, name);
   if (frames < 1000) miscompiled.push(`${name}: only ${frames} functions set up a frame record`);
+  for (const text of toolDescriptions) if (addon.includes(text)) withTools.push(`${name}: "${text}"`);
   await rm(platform.dir, { recursive: true, force: true });
 }
 assert.deepEqual(miscompiled, [], `a native addon was built with the wrong code generation settings; see addNapiArtifact in build.zig:\n${miscompiled.join("\n")}`);
+assert.deepEqual(withTools, [], `a native addon contains fx's built-in tools; build it with builtin_tools false:\n${withTools.join("\n")}`);
 
 if (process.argv.includes("--print")) {
   console.log(JSON.stringify(measured, null, 2));
@@ -97,4 +115,4 @@ for (const [name, sizes] of Object.entries(measured)) {
   }
 }
 assert.deepEqual(over, [], `over budget. A .wasm over its budget may have skipped sdk/scripts/optimize-wasm.mjs:\n${over.join("\n")}`);
-console.log(`Package sizes passed: ${Object.keys(measured).length} files and packages within their budgets, and every native addon has the expected code generation settings`);
+console.log(`Package sizes passed: ${Object.keys(measured).length} files and packages within their budgets, every native addon has the expected code generation settings, and none contains fx's built-in tools`);

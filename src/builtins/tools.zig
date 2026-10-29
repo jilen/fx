@@ -759,12 +759,18 @@ const names_only = blk: {
     break :blk tools;
 };
 
-fn unavailableDecode(_: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    return error.InvalidToolArguments;
+// A call that reaches a tool kept only by name gets the answer fx gives for
+// any tool it doesn't have, which the model can read and recover from.
+fn unavailableDecode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return .{ .failure = try unsupported(ctx) };
 }
 
-fn unavailableCall(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return error.InvalidToolArguments;
+fn unavailableCall(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return .{ .failure = try unsupported(ctx) };
+}
+
+fn unsupported(ctx: tool_dispatch.DispatchContext) error{OutOfMemory}![]u8 {
+    return ctx.allocator.print("Unsupported tool: {s}", .{ctx.tool_call_name});
 }
 
 fn unavailableReadsOnly(_: tool_dispatch.ToolInput) bool {
@@ -775,7 +781,7 @@ fn unavailableIrreversible(_: tool_dispatch.ToolInput) bool {
     return true;
 }
 
-test "without the tools' code, the registry still holds every tool's name" {
+test "without the tools' code, the registry keeps every tool's name and answers Unsupported tool" {
     try std.testing.expectEqual(all.len, names_only.len);
     for (names_only, all) |tool, real| {
         try std.testing.expectEqualStrings(real.name, tool.name);
@@ -784,6 +790,20 @@ test "without the tools' code, the registry still holds every tool's name" {
     const names = tool_dispatch.Registry{ .tools = names_only[0..] };
     for (advertisement_order) |name| try std.testing.expect(names.lookup(name) != null);
     try std.testing.expect(names.lookup("not_a_builtin_tool") == null);
+
+    const entry = names.lookup("shell").?;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = std.testing.allocator, .tool_call_name = "shell" };
+    const decoded = try entry.decode(ctx, "{\"action\":\"run\",\"command\":\"true\"}");
+    defer std.testing.allocator.free(decoded.failure);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", decoded.failure);
+
+    const NoInput = struct {
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+    };
+    var unused: u8 = 0;
+    const called = try entry.call(ctx, .{ .ptr = &unused, .deinit_fn = NoInput.deinit });
+    defer called.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", called.failure);
 }
 
 pub const advertisement_order = [_][]const u8{

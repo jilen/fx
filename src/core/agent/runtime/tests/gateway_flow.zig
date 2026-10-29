@@ -6652,7 +6652,7 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     try std.testing.expect(!checkpoint.outstanding_reservation);
 }
 
-test "processQueuedPrompt cancellation during recovery clears the durable checkpoint" {
+test "processQueuedPrompt cancellation during recovery ends the durable checkpoint with its commit" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .status = .service_unavailable },
@@ -6671,11 +6671,43 @@ test "processQueuedPrompt cancellation during recovery clears the durable checkp
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     // The cancel lands during the episode's first retry wait, before any
-    // recovery strategy is assigned: the checkpoint must still die with the
-    // turn or the next resume would revive a turn the user stopped.
+    // recovery strategy is assigned. The turn is saved as interrupted, and
+    // that commit ends its checkpoint, so the next resume cannot revive it. A
+    // separate clear first would end the turn twice in a libfx journal.
     try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt cancellation still clears the durable checkpoint when saving the turn fails" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .service_unavailable },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    hooks.history_propagation_error = error.TestHistoryPropagationFailed;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try std.testing.expectError(
+        error.TestHistoryPropagationFailed,
+        runFakePrompt(&gateway, &hooks, config, fixture.job()),
+    );
+
+    // No commit reached the host, so the clear is what keeps a later resume
+    // from continuing the cancelled turn.
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
 }
 
 test "processQueuedPrompt cancellation during network backoff clears retry status" {

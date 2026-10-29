@@ -5413,6 +5413,52 @@ fn clearRecoveryCheckpoint(deps: *const AgentRuntimeDeps, comptime why: []const 
     };
 }
 
+/// Ends a cancelled turn as interrupted. Committing that turn also closes its
+/// durable checkpoint, so the checkpoint is cleared only when no commit follows:
+/// the turn was already saved, or saving it failed after it started. A clear
+/// before the commit would end the turn twice in a libfx journal and drop the
+/// turn id a host uses to skip a retried prompt.
+fn persistCancelledTurn(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: ?[]const u8,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+) !void {
+    if (persisted.*) {
+        clearRecoveryCheckpoint(deps, "cancel");
+        return;
+    }
+    runtime_interruption.persistInterruptedTurnOnce(
+        deps,
+        finalization,
+        job,
+        partial_assistant,
+        null,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+    ) catch |err| {
+        // Before saving starts, the caller's fallback commits the work and
+        // that commit closes the checkpoint; a clear here would end it twice.
+        if (terminal_materializing.*) clearRecoveryCheckpoint(deps, "cancel");
+        debug_trace.logf(
+            "agent",
+            "cancel could not save the interrupted turn err={s} saving_started={s}",
+            .{ @errorName(err), if (terminal_materializing.*) "true" else "false" },
+        );
+        return err;
+    };
+}
+
 fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
     if (cause == .content_filter) return types.ModelFailureDiagnostic.init("content_filter");
     return types.ModelFailureDiagnostic.forCause(checkpointCause(cause));
@@ -7184,8 +7230,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
-            clearRecoveryCheckpoint(deps, "cancel");
-            try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+            try persistCancelledTurn(deps, finalization, job, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
         }
@@ -8213,8 +8258,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    clearRecoveryCheckpoint(deps, "cancel");
-                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    try persistCancelledTurn(deps, finalization, job, interruption_source, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
                 }
@@ -8824,8 +8868,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpoint(deps, "cancel");
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try persistCancelledTurn(deps, finalization, job, interruption_source, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }
@@ -8878,8 +8921,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
-                clearRecoveryCheckpoint(deps, "cancel");
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try persistCancelledTurn(deps, finalization, job, interruption_source, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -9205,8 +9247,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpoint(deps, "cancel");
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        try persistCancelledTurn(deps, finalization, job, partial_assistant, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
                     }

@@ -1351,7 +1351,7 @@ fn mentionMenuOpen(skills: []const Skill, query: []const u8) bool {
     } else return skillMenuFilterQueryCount(skills, .all, query) > 0;
     for (skills) |skill| {
         const found = fuzzy_match.match(query, &.{.{ .text = skill.name }}) orelse continue;
-        if (@backingInt(found.tier) >= @backingInt(fuzzy_match.Tier.substring)) return true;
+        if (found.tier.isAsTyped()) return true;
     }
     return false;
 }

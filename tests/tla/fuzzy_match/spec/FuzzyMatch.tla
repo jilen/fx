@@ -145,8 +145,13 @@ MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 
 NoMatch == [tier |-> "none", field |-> 0]
 
-\* R1 to R7. `fs` is never empty. R6: a query with no word characters that
-\* no field holds as typed matches nothing.
+\* R12: the most characters a query can have and still match by words or
+\* letters in order. A longer query matches only as typed.
+MaxFuzzyChars == 64
+
+\* R1 to R7 and R12. `fs` is never empty. R6: a query with no word characters
+\* that no field holds as typed matches nothing, and R12: neither does a query
+\* longer than MaxFuzzyChars.
 Match(q, fs) ==
     LET t == Trim(q)
     IN IF t = <<>> THEN [tier |-> "exact", field |-> 1]
@@ -155,6 +160,7 @@ Match(q, fs) ==
              best == MaxTier(whole)
          IN IF TierRank[best] >= TierRank["substring"]
             THEN [tier |-> best, field |-> FirstWith(whole, best)]
+            ELSE IF Len(t) > MaxFuzzyChars THEN NoMatch
             ELSE
               LET ws == SelectSeq(Words(t), HasWordChar)
               IN IF ws = <<>> THEN NoMatch

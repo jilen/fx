@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const display_width = @import("display_width.zig");
+const ascii_case = @import("ascii_case.zig");
 
 /// How well an item matches, worst first (R1).
 pub const Tier = enum {
@@ -25,7 +26,18 @@ pub const Tier = enum {
     prefix,
     /// A name field is the whole query (R3).
     exact,
+
+    /// Whether this tier holds the whole query as typed (R3), the matches
+    /// a filtered listing prefers (R11).
+    pub fn isAsTyped(tier: Tier) bool {
+        return @backingInt(tier) >= @backingInt(Tier.substring);
+    }
 };
+
+/// R12: the most characters a query can have and still match by words or by
+/// letters in order. A longer query matches only as typed, so a pasted
+/// paragraph costs each item its fields and no more.
+const max_fuzzy_chars = 64;
 
 pub const Field = struct {
     text: []const u8,
@@ -62,17 +74,35 @@ pub fn match(query: []const u8, fields: []const Field) ?Match {
     for (fields[0..cached], sets[0..cached]) |field, *set| set.* = .of(field.text);
 
     if (wholeQueryMatch(text, fields, &sets)) |found| return found;
+    if (overFuzzyLimit(text)) return null;
     return wordsMatch(text, fields, &sets);
 }
 
+/// Whether `text` has more than `max_fuzzy_chars` characters (R8, R12). It
+/// stops counting one character past the limit, so any paste costs the same.
+fn overFuzzyLimit(text: []const u8) bool {
+    if (text.len <= max_fuzzy_chars) return false;
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) : (index += charLen(text, index)) {
+        count += 1;
+        if (count > max_fuzzy_chars) return true;
+    }
+    return false;
+}
+
 /// R3: the best tier any field gives the whole query, lowest index on ties.
+/// A field shorter than the query cannot hold it, and the query is read only
+/// once a field is long enough, so a long query costs no more than the
+/// fields it fits in.
 fn wholeQueryMatch(text: []const u8, fields: []const Field, sets: *const [cached_field_sets]CharSet) ?Match {
-    const needed: CharSet = .of(text);
-    const ascii = !hasNonAscii(text);
+    var query: ?struct { needed: CharSet, ascii: bool } = null;
     var best: ?Match = null;
     for (fields, 0..) |field, index| {
-        if (!fieldSet(sets, index).covers(needed)) continue;
-        const tier = wholeQueryTier(field, text, ascii) orelse continue;
+        if (field.text.len < text.len) continue;
+        if (query == null) query = .{ .needed = .of(text), .ascii = !hasNonAscii(text) };
+        if (!fieldSet(sets, index).covers(query.?.needed)) continue;
+        const tier = wholeQueryTier(field, text, query.?.ascii) orelse continue;
         if (best == null or @backingInt(tier) > @backingInt(best.?.tier)) best = .{ .tier = tier, .field = index };
         if (tier == .exact) break;
     }
@@ -191,23 +221,11 @@ fn matchAt(haystack: []const u8, start: usize, needle: []const u8) ?usize {
 /// An ASCII needle can only match ASCII bytes, which are always boundaries,
 /// so it takes the byte search.
 fn contains(haystack: []const u8, needle: []const u8, needle_is_ascii: bool) bool {
+    if (needle_is_ascii) return ascii_case.containsIgnoreCase(haystack, needle);
     if (needle.len > haystack.len) return false;
-    if (needle_is_ascii) return containsAscii(haystack, needle);
     var start: usize = 0;
     while (start < haystack.len) : (start += charLen(haystack, start)) {
         if (matchAt(haystack, start, needle) != null) return true;
-    }
-    return false;
-}
-
-/// Linear on purpose: `std.ascii.findIgnoreCase` fills a 2 KiB skip table
-/// on every call, which costs more than these short fields take to scan.
-fn containsAscii(haystack: []const u8, needle: []const u8) bool {
-    const first = std.ascii.toLower(needle[0]);
-    const rest = needle[1..];
-    for (0..haystack.len - needle.len + 1) |start| {
-        if (std.ascii.toLower(haystack[start]) != first) continue;
-        if (std.ascii.eqlIgnoreCase(haystack[start + 1 ..][0..rest.len], rest)) return true;
     }
     return false;
 }
@@ -464,7 +482,7 @@ pub fn Filter(comptime Context: type) type {
         pub fn init(context: Context, len: usize) Self {
             const floor: Tier = for (0..len) |position| {
                 const found = context.matchAt(position) orelse continue;
-                if (@backingInt(found.tier) >= @backingInt(Tier.substring)) break .substring;
+                if (found.tier.isAsTyped()) break .substring;
             } else .fuzzy;
             return .{ .context = context, .len = len, .floor = floor };
         }
@@ -747,16 +765,12 @@ test "filters keep as-typed matches when any exist and otherwise fall back" {
     try std.testing.expectEqual(@as(?usize, 2), picked.at(0));
 }
 
-fn upperAscii(dest: []u8, text: []const u8) []const u8 {
-    for (dest[0..text.len], text) |*out, byte| out.* = std.ascii.toUpper(byte);
-    return dest[0..text.len];
-}
-
 /// The model's laws on arbitrary bytes: the answer is well formed and
 /// repeatable, case never matters, typing more never shows more once the
 /// query has a word character, a query of only ASCII punctuation matches
-/// exactly where a field holds it, a field equal to the query gives the best
-/// tier its kind allows, and adding a field never lowers the tier.
+/// exactly where a field holds it, a query over the R12 limit matches only as
+/// typed, a field equal to the query gives the best tier its kind allows, and
+/// adding a field never lowers the tier.
 fn fuzzMatchLaws(_: void, smith: *std.testing.Smith) !void {
     var buffer: [512]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
@@ -785,7 +799,7 @@ fn fuzzMatchLaws(_: void, smith: *std.testing.Smith) !void {
     if (std.mem.trim(u8, query, whitespace).len == 0) try std.testing.expectEqual(@as(?Match, .{ .tier = .exact, .field = 0 }), answer);
 
     var upper: [512]u8 = undefined;
-    try std.testing.expectEqual(answer, match(upperAscii(&upper, query), item));
+    try std.testing.expectEqual(answer, match(std.ascii.upperString(&upper, query), item));
 
     if (answer != null) {
         var end: usize = 0;
@@ -807,6 +821,9 @@ fn fuzzMatchLaws(_: void, smith: *std.testing.Smith) !void {
             if (std.mem.find(u8, field.text, trimmed) != null) break true;
         } else false;
         try std.testing.expectEqual(held, answer != null);
+    }
+    if (answer) |found| {
+        if (overFuzzyLimit(trimmed)) try std.testing.expect(found.tier.isAsTyped());
     }
     for (item, 0..) |field, index| {
         if (trimmed.len == 0 or !std.mem.eql(u8, field.text, trimmed)) continue;

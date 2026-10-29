@@ -116,12 +116,18 @@ function worst(tiers: Tier[]): Tier {
 }
 
 /// R1 to R7. `field` counts from 1, as in the model.
+/// R12: the most characters a query can have and still match by words or
+/// letters in order.
+export const MAX_FUZZY_CHARS = 64;
+
 export function match(q: string[], fs: AtomField[]): Match {
   const t = trim(q);
   if (t.length === 0) return { tier: "exact", field: 1 };
   const whole = fs.map((fd) => wholeTier(fd, t));
   const top = best(whole);
   if (TIER_RANK[top] >= TIER_RANK.substring) return { tier: top, field: whole.indexOf(top) + 1 };
+  // R12: a longer query matches only as typed.
+  if (t.length > MAX_FUZZY_CHARS) return { tier: "none", field: 0 };
   const ws = words(t).filter(hasWordChar);
   // R6: only punctuation, and no field holds it as typed.
   if (ws.length === 0) return { tier: "none", field: 0 };

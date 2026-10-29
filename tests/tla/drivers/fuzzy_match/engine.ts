@@ -15,7 +15,7 @@ import { judgeCases, judgeListings, modelMatch } from "./tlc-cases.ts";
 const SHARED = join(REPO_ROOT, "src", "core", "shared");
 // The engine and the files it imports, copied so a planted bug never
 // touches src/.
-const ENGINE_FILES = ["fuzzy_match.zig", "display_width.zig", "unicode_display_data.zig"];
+const ENGINE_FILES = ["fuzzy_match.zig", "ascii_case.zig", "display_width.zig", "unicode_display_data.zig"];
 
 export type Answer = { tier: Tier; field: number | null };
 
@@ -176,11 +176,14 @@ export async function lawsOnEngine(bin: string, seed: number, count: number) {
   return { cases: base.length, probes: probes.length, broken };
 }
 
+/// The words B1's items are made of.
+const B1_WORDS = ["fix", "renderer", "add", "oauth", "login", "flow", "update", "skills", "menu", "fuzzy", "search", "session", "model", "picker", "cache", "test", "e2e", "zig", "release", "notes"];
+const EVERYDAY_WORDS = "the quick brown fox jumps over the lazy dog while a model renders the session and fixes login flow before release notes ship to every user who searches".split(" ");
+
 function realisticItems(rand: () => number, n: number): Field[][] {
-  const words = ["fix", "renderer", "add", "oauth", "login", "flow", "update", "skills", "menu", "fuzzy", "search", "session", "model", "picker", "cache", "test", "e2e", "zig", "release", "notes"];
   const phrase = (bytes: number) => {
     let out = "";
-    while (out.length < bytes) out += `${words[Math.floor(rand() * words.length)]}${rand() < 0.2 ? "-" : " "}`;
+    while (out.length < bytes) out += `${B1_WORDS[Math.floor(rand() * B1_WORDS.length)]}${rand() < 0.2 ? "-" : " "}`;
     return out.slice(0, bytes);
   };
   return Array.from({ length: n }, () => [
@@ -201,7 +204,7 @@ async function bench(bin: string, items: Field[][], queries: Uint8Array[], passe
   return { fastestNs: parsed.min_ns, matches: parsed.matches / passes };
 }
 
-/// B1 to B4 from design/GOAL.md, on a ReleaseSafe harness. Times are the
+/// B1 to B5 from design/GOAL.md, on a ReleaseSafe harness. Times are the
 /// fastest of several runs; today's scan runs on the same input beside the
 /// engine for scale.
 export async function stress(bin: string, seed: number) {
@@ -252,6 +255,23 @@ export async function stress(bin: string, seed: number) {
   const malformed = answers.filter((a, i) => !(a.tier in TIER_RANK) || (a.tier === "none") !== (a.field === null) || (a.field !== null && (a.field < 0 || a.field >= huge[i]!.fields.length)));
   results.B4 = { cases: huge.length, malformed: malformed.length };
   if (malformed.length > 0) failures.push(`B4: ${malformed.length} malformed answers`);
+
+  // B5: 64 KiB pastes over B1's items. Words from B1's own vocabulary are
+  // the worst case, since every item holds most of them and every query
+  // word must match (R4); R12 is what keeps each item's cost to its fields.
+  const paste = (pieces: string[]) => {
+    let out = "";
+    for (let i = 0; out.length < 65536; i += 1) out += `${pieces[i % pieces.length]} `;
+    return utf8(out.slice(0, 65536));
+  };
+  const pastes = { token: utf8("ab".repeat(32768)), everyday: paste(EVERYDAY_WORDS), itemWords: paste(B1_WORDS) };
+  const b5: Record<string, number> = {};
+  for (const [name, query] of Object.entries(pastes)) {
+    const run = await bench(bin, items5k, [query], 3);
+    b5[name] = run.fastestNs / 1e6;
+    if (!(b5[name]! < 5)) failures.push(`B5: a 64 KiB ${name} paste took ${b5[name]!.toFixed(3)} ms per pass, budget 5 ms`);
+  }
+  results.B5 = { perPassMs: b5, budgetMs: 5 };
   return { results, failures };
 }
 

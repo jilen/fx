@@ -9,7 +9,11 @@ Twelve places in fx filter a list as the user types, and each one has its own ma
 One pure engine, `src/core/shared/fuzzy_match.zig`, decides whether an item matches a query and how well. Every surface in `CONTEXT.md` calls it instead of its own matcher. Each surface keeps its own base order, grouping, and windowing; the engine only classifies.
 
 ```zig
-pub const Tier = enum { fuzzy, words, substring, prefix, exact };
+pub const Tier = enum {
+    fuzzy, words, substring, prefix, exact,
+    /// `substring` or better: the whole query as typed (R3, R11).
+    pub fn isAsTyped(tier: Tier) bool;
+};
 
 pub const Field = struct {
     text: []const u8,
@@ -32,7 +36,7 @@ pub fn Filter(comptime Context: type) type; // init, keeps, count, at
 
 `Ranking` is the one implementation of R10 and `Filter` the one implementation of R11, so no surface sorts or falls back its own way. A caller whose base order is not its item order, such as skills by source group, maps positions to items in `matchAt`.
 
-`field` is the index into `fields`. No match is `null`, so `Tier` has no `none`; the model writes it as tier `none`. The engine imports nothing outside `src/core/shared/`: `std`, and `display_width.zig` to decode UTF-8 as `AGENTS.md` requires. It allocates nothing and keeps no state.
+`field` is the index into `fields`. No match is `null`, so `Tier` has no `none`; the model writes it as tier `none`. The engine imports nothing outside `src/core/shared/`: `std`, `display_width.zig` to decode UTF-8 as `AGENTS.md` requires, and `ascii_case.zig` for ASCII case-insensitive search, which `text_utils.zig` shares. It allocates nothing and keeps no state.
 
 ## Rules
 
@@ -51,6 +55,7 @@ The model in `spec/FuzzyMatch.tla` defines these rules, and each check cites the
 | R9 | A field word starts at the first character, after a separator, and where a digit follows a non-digit or a non-digit follows a digit, so `gpt-4o` has the words `gpt`, `4`, and `o`. |
 | R10 | A ranked surface lists its matches by tier, best first, then by `field`, lowest first, and otherwise in its own base order. |
 | R11 | A filtered surface keeps its base order. It lists the items that match as typed, `substring` or better, when any does, and otherwise every item that matches. |
+| R12 | A trimmed query of more than 64 characters, counted as R8 counts them, matches only by R3, as typed, and otherwise matches nothing. |
 
 ## Laws
 
@@ -60,7 +65,7 @@ The model checks each law over every query and field it can build from its alpha
 | --- | --- | --- |
 | L1 | The step-by-step `Match` equals the declarative definition of R1 to R9. | `MatchIsDeclarative` |
 | L2 | Narrowing: once a query has a word character, or while it is blank, typing more never adds a match, so every such prefix of a matching query matches too. A prefix of only punctuation matches only as typed (L10). | `Narrowing` |
-| L3 | Nothing that matches today stops matching: an item with a field that contains the whole query matches as `substring` or better, and, once the query has a word character, an item where every query word appears in some field matches. | `KeepsSubstringMatches`, `KeepsTokenMatches` |
+| L3 | Nothing that matches today stops matching: an item with a field that contains the whole query matches as `substring` or better, and, once the query has a word character and at most 64 characters (R12), an item where every query word appears in some field matches. | `KeepsSubstringMatches`, `KeepsTokenMatches` |
 | L4 | Case never matters for ASCII letters. | `CaseInsensitive` |
 | L5 | A `text` field never gives `exact`, `prefix`, or a match by R5. | `TextNeverFuzzy` |
 | L6 | Adding a field never lowers an item's tier, and reordering fields of one kind changes only `field`. | `MoreFieldsNeverWorse`, `FieldOrderOnlyMovesIndex` |
@@ -69,6 +74,7 @@ The model checks each law over every query and field it can build from its alpha
 | L9 | A filtered listing shows only matches, each once, in base order. | `FilteredKeepsOrder` |
 | L10 | A query of only punctuation matches exactly the items with a field that holds it as typed. | `PunctuationMatchesAsTyped` |
 | L11 | A filtered listing shows exactly the as-typed matches when there are any, and otherwise every match, so it is never empty while something matches. | `FilteredPrefersAsTyped` |
+| L12 | A query of more than 64 characters matches exactly the items with a field that holds it as typed. | `LongQueriesMatchAsTyped` |
 
 ## Decisions
 
@@ -84,6 +90,7 @@ The model checks each law over every query and field it can build from its alpha
 | D8 | `/` commands match without case. | R8, and the same as every other menu. |
 | D9 | Filtered surfaces fall back to word and fuzzy matches only when nothing matches as typed (R11). | Without a ranking to push them down, near-misses sat beside exact hits: in `/resume`, `workspace B` also listed workspace A because its temporary path holds a `b`, and an exact session marker also listed a newer session whose marker has one more digit. The fallback keeps today's results whenever today's matcher finds anything. Where as-typed matches run out, typing more can show more. |
 | D10 | A `$` mention query that holds a byte no skill name continues with, anything but a letter, digit, `_`, or `-`, keeps the mention menu open only for a skill whose name contains the query as typed. Enter takes a completion only from a mention menu that is shown, and otherwise sends the prompt. | Sending a prompt ends a mention at that byte (`matchesSigilSkillAt` in `src/core/skills/skill_runtime.zig`), so `Use $status-second.` names `status-second`. Word matching read `status-second.` as the words `status` and `second`, kept the menu open, and Enter took the completion instead of sending the prompt (`tests/e2e/gateway-stream-lifecycle.test.ts`, "requested skill status reflects prepared content without tool activity"). Names such as `my.skill` still complete as typed. |
+| D11 | A query of more than 64 characters matches only as typed (R12). | Every word must match (R4), so the work for each item grows with the number of query words, and only a limit bounds it. Over 5,000 session-sized items the engine took 476 ms per keystroke for a 64 KiB paste of one token, 139 ms for 64 KiB of everyday prose, and 2.8 s for 64 KiB of words every item holds, against 5.1 ms for 64 bytes of those words. The user chose 64. The limit counts characters, as the model does, which for ASCII is the same as bytes, and the code stops counting at the 65th character, so the check costs the same for any paste. A pasted title longer than the limit still matches where it appears as typed. |
 
 ## Success criteria
 
@@ -111,6 +118,7 @@ Measured on the build `zig build -Doptimize=ReleaseSafe` produces, through the h
 | B2 | 1,000 items whose three 240-byte fields are `b` and then 239 `a`, with the 120-byte query of 119 `a` and then `b`. Every position compares about 120 characters and nothing matches, for both scans, and the field holds every query character, so no character filter can skip the work. A query longer than the field would let today's scan stop at once and measure nothing. | At most 4 times today's substring scan on the same input |
 | B3 | Item counts of 1,000, 2,000, 4,000, and 8,000 with B1's shapes | Time grows at most linearly: each doubling at most 2.5 times slower |
 | B4 | Queries and fields of random bytes up to 4 KiB, including invalid UTF-8 | No crash, and every answer a valid `?Match` |
+| B5 | B1's 5,000 items and three 64 KiB pastes: one token, everyday prose, and prose made only of the words B1's items hold | Under 5 ms per pass for each |
 
 ## Non-goals
 

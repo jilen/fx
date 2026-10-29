@@ -114,7 +114,7 @@ DWordLevel(fd, w) ==
     THEN (IF DRun(fd.text, w) THEN 2 ELSE IF DFuzzy(fd.text, w) THEN 1 ELSE 0)
     ELSE (IF DContains(fd.text, w) THEN 2 ELSE 0)
 
-\* R1 to R7.
+\* R1 to R7 and R12.
 DMatch(query, fields) ==
     LET t == DTrim(query)
         I == 1..Len(fields)
@@ -123,6 +123,7 @@ DMatch(query, fields) ==
          LET best == DMax({DWhole(fields[i], t) : i \in I})
          IN IF best >= 3
             THEN [tier |-> DName(best), field |-> DMin({i \in I : DWhole(fields[i], t) = best})]
+            ELSE IF Len(t) > MaxFuzzyChars THEN [tier |-> "none", field |-> 0]
             ELSE
               LET ws == {w \in DWords(t) : \E i \in 1..Len(w) : DIsWord(w[i])}
                   level(w) == DMax({DWordLevel(fields[i], w) : i \in I})
@@ -160,10 +161,11 @@ KeepsSubstringMatches ==
     (\E i \in 1..Len(fs) : DContains(fs[i].text, DTrim(q)))
         => TierRank[Match(q, fs).tier] >= TierRank["substring"]
 
-\* A query of only punctuation matches only as typed (L10), so the token
-\* half holds once the query has a word character.
+\* A query of only punctuation matches only as typed (L10), and so does one
+\* longer than MaxFuzzyChars (L12), so the token half holds once the query has
+\* a word character and is no longer than that.
 KeepsTokenMatches ==
-    (DHasWord(q) /\ \A w \in DWords(DTrim(q)) : \E i \in 1..Len(fs) : DContains(fs[i].text, w))
+    (DHasWord(q) /\ Len(DTrim(q)) <= MaxFuzzyChars /\ \A w \in DWords(DTrim(q)) : \E i \in 1..Len(fs) : DContains(fs[i].text, w))
         => Matches(q, fs)
 
 \* L10: a query of only punctuation matches exactly the items with a field
@@ -171,6 +173,16 @@ KeepsTokenMatches ==
 PunctuationMatchesAsTyped ==
     (DTrim(q) # <<>> /\ ~DHasWord(q))
         => (Matches(q, fs) <=> \E i \in 1..Len(fs) : DContains(fs[i].text, DTrim(q)))
+
+\* L12: a query longer than MaxFuzzyChars matches exactly the items with a
+\* field that holds it as typed.
+LongQueriesMatchAsTyped ==
+    Len(DTrim(q)) > MaxFuzzyChars
+        => (Matches(q, fs) <=> \E i \in 1..Len(fs) : DContains(fs[i].text, DTrim(q)))
+
+\* A limit small enough for a config's short queries to cross (R12), bound
+\* with `MaxFuzzyChars <- SmallFuzzyLimit`.
+SmallFuzzyLimit == 2
 
 \* L4.
 FoldAll(s) == [i \in DOMAIN s |-> DFold(s[i])]

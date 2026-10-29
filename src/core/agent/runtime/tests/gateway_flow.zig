@@ -8013,8 +8013,9 @@ fn runStalledToolWorkTurn(shape: StallShape) !void {
     const last_status = hooks.route_recovery_statuses.items.len - 1;
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.terminal_provider_error, hooks.route_recovery_statuses.items[last_status].kind);
     try std.testing.expectEqual(types.ModelRecoveryRequiredAction.surface_stall, hooks.route_recovery_statuses.items[last_status].required_action);
-    // Committing the saved turn closes its checkpoint, so no separate clear
-    // ends the turn a second time.
+    // Committing the saved turn closes its open checkpoint, so no separate
+    // clear ends the turn a second time.
+    try std.testing.expect(hooks.recovery_checkpoint_calls > 0);
     try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoint_clears);
     try expectSavedStalledTurn(&hooks, prompt, 1, stallSavedReply(shape));
 
@@ -8052,6 +8053,7 @@ test "stall stop still ends the turn when saving its completed work fails" {
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.enable_recovery_checkpoint = true;
+    hooks.capture_restored_prompts = true;
     hooks.history_propagation_error = error.TestHistoryPropagationFailed;
     hooks.tool_registry = builtin_tools.registry;
     hooks.exec_plans = try stallToolExecPlans(arena, 1, stall_work_tool_result);
@@ -8062,10 +8064,13 @@ test "stall stop still ends the turn when saving its completed work fails" {
         runFakePrompt(&gateway, &hooks, stallWorkConfig(&fixture), fixture.job()),
     );
 
-    // The turn still ends stopped, and a later resume must not continue it.
+    // The turn still ends stopped, a later resume must not continue it, and
+    // the prompt is back in the composer even though the save failed.
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restored_prompts.items.len);
+    try std.testing.expectEqualStrings(fixture.job().prompt, hooks.restored_prompts.items[0]);
 }
 
 test "stall stop keeps hundreds of completed tool steps" {

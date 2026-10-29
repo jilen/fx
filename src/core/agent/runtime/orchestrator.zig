@@ -5217,7 +5217,14 @@ fn finishRecoveryStalled(
         current_turn_messages,
         terminal_materializing,
     ) catch |err| {
-        clearStalledRecoveryCheckpoint(deps);
+        // Before saving starts, the caller's fallback commits the work and
+        // that commit closes the checkpoint; a clear here would end it twice.
+        if (terminal_materializing.*) clearStalledRecoveryCheckpoint(deps);
+        debug_trace.logf(
+            "agent",
+            "stall stop could not save the turn's completed work err={s} saving_started={s}",
+            .{ @errorName(err), if (terminal_materializing.*) "true" else "false" },
+        );
         return err;
     };
     if (kept_work) {

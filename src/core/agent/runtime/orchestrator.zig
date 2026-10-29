@@ -5202,18 +5202,12 @@ fn finishRecoveryStalled(
         .required_action = .surface_stall,
         .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
     });
-    // A stall-stopped turn is terminally dead: without clearing the durable
-    // checkpoint, the next resume would auto-continue it and re-spend attempts
-    // on a turn the UI already called stopped.
-    if (deps.recovery_checkpoint) |effect| {
-        effect.clear(deps.ctx) catch |err| {
-            debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
-        };
-    }
     // The turn stops, but the work it already did stays in the conversation.
     // Without it the next request has no record of the prompt or the completed
     // tool steps, and the agent treats its own changes as someone else's.
-    if (try runtime_interruption.persistFailedTurnWorkOnce(
+    // Committing the saved turn also closes its durable checkpoint, so a
+    // separate clear first would end the turn twice in a libfx journal.
+    const kept_work = runtime_interruption.persistFailedTurnWorkOnce(
         deps,
         finalization,
         job,
@@ -5222,9 +5216,17 @@ fn finishRecoveryStalled(
         trace_ctx,
         current_turn_messages,
         terminal_materializing,
-    )) {
+    ) catch |err| {
+        clearStalledRecoveryCheckpoint(deps);
+        return err;
+    };
+    if (kept_work) {
         debug_trace.logf("agent", "stall stop kept the turn's completed work partial_bytes={d}", .{partial_assistant.len});
     } else {
+        // A stall-stopped turn is terminally dead: without clearing the durable
+        // checkpoint, the next resume would auto-continue it and re-spend
+        // attempts on a turn the UI already called stopped.
+        clearStalledRecoveryCheckpoint(deps);
         debug_trace.logf(
             "agent",
             "stall stop dropped a turn with no completed work partial_bytes={d}",
@@ -5233,6 +5235,13 @@ fn finishRecoveryStalled(
         try finalization.finish(.failed, null, null);
     }
     finish_trace.finish("recovery_stalled");
+}
+
+fn clearStalledRecoveryCheckpoint(deps: *const AgentRuntimeDeps) void {
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on stall stop failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn pushUnsafeNoRetryStatus(
@@ -8075,6 +8084,9 @@ fn processQueuedPromptLoop(
                 }
                 if (recovery_decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // The prompt goes back before the turn is saved, so a failed save
+                    // cannot also lose it.
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8092,7 +8104,6 @@ fn processQueuedPromptLoop(
                         &stop_state.terminal_materializing,
                         step_ctx,
                     );
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
                 if (network_failure != null) {
@@ -8527,6 +8538,9 @@ fn processQueuedPromptLoop(
                 }
                 if (decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // The prompt goes back before the turn is saved, so a failed save
+                    // cannot also lose it.
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8544,7 +8558,6 @@ fn processQueuedPromptLoop(
                         &stop_state.terminal_materializing,
                         step_ctx,
                     );
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
                 if (decision.reserve_provider_attempt) {
@@ -8905,6 +8918,9 @@ fn processQueuedPromptLoop(
                 }
                 if (decision.required_action == .surface_stall) {
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // The prompt goes back before the turn is saved, so a failed save
+                    // cannot also lose it.
+                    restorePromptAfterTerminalFailure(deps, job, config);
                     try finishRecoveryStalled(
                         deps,
                         finalization,
@@ -8922,7 +8938,6 @@ fn processQueuedPromptLoop(
                         &stop_state.terminal_materializing,
                         step_ctx,
                     );
-                    restorePromptAfterTerminalFailure(deps, job, config);
                     return;
                 }
                 const decision_auto_recovers = decision.autoRecovers();

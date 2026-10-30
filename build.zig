@@ -431,6 +431,17 @@ fn addNapiArtifact(
             .target = target,
             .optimize = .safe,
             .link_libc = true,
+            // Node never unwinds C++ exceptions through the addon, and its Zig
+            // code already bounds-checks in ReleaseSafe, so unwind tables and
+            // stack canaries only add size. Unlike the fx executable, the
+            // addon keeps frame pointers: Apple's arm64 ABI requires them,
+            // crash reports and profilers of the app walk them through the
+            // addon, and on x86-64 they make it about 0.2 MB smaller.
+            .stack_check = false,
+            .stack_protector = false,
+            .omit_frame_pointer = false,
+            .unwind_tables = .none,
+            .error_tracing = false,
             .strip = true,
         }),
     });

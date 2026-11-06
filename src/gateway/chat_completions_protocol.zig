@@ -7,6 +7,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -44,13 +45,13 @@ pub const Error = error{
     RequiredToolMissing,
     UnexpectedToolCall,
     InvalidChunk,
+    MalformedChatCompletionsChunk,
     ConflictingIdentity,
     InvalidFinishReason,
     InconsistentFinishReason,
     IncompleteStream,
     StreamClosed,
     ProviderError,
-    OutputTruncated,
     ContentFiltered,
     Refused,
     EventTooLarge,
@@ -68,7 +69,7 @@ pub const Error = error{
 const max_selected_tools = 256;
 const max_name_bytes = 128;
 const max_history_arguments_bytes = 1024 * 1024;
-const max_json_depth = 64;
+const max_json_depth = json_depth.max_depth;
 
 const Function = struct {
     name: []const u8,
@@ -205,28 +206,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
 }
 
 fn check_json_depth(text: []const u8) Error!void {
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (text) |byte| {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') quoted = false;
-        } else switch (byte) {
-            '"' => quoted = true,
-            '{', '[' => {
-                if (depth == max_json_depth) return error.JsonTooDeep;
-                depth += 1;
-            },
-            '}', ']' => if (depth > 0) {
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
+    if (json_depth.exceeds(text)) return error.JsonTooDeep;
 }
 
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
@@ -727,13 +707,16 @@ pub const Reducer = struct {
         try check_json_depth(data);
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidChunk,
+            // Valid JSON that fx refuses ends the turn. Text that is not JSON
+            // at all was damaged on the way, so the request is resent.
+            error.DuplicateField => return error.InvalidChunk,
+            else => return error.MalformedChatCompletionsChunk,
         };
         defer parsed.deinit();
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
-        try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
-        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        try self.accept_identity("id", &self.generation_id, non_null(root, "id"), self.limits.identity_bytes, .label);
+        try self.accept_identity("model", &self.response_model, non_null(root, "model"), configured_provider.max_model_bytes, .label);
         const choices_value = root.get("choices") orelse return error.InvalidChunk;
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
@@ -861,13 +844,40 @@ pub const Reducer = struct {
         return try out.toOwnedSlice();
     }
 
-    fn accept_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize) Error!void {
+    /// How strictly a streamed field must keep the first value it reported.
+    const IdentityPolicy = enum {
+        /// A name that only labels the reply. A gateway may answer one stream
+        /// with two upstream generations (a refusal handed on to the next
+        /// candidate, a stall asked again), and the text the user keeps is
+        /// still usable: fx keeps the first name it saw and records the change
+        /// rather than failing a turn whose content and calls are sound.
+        label,
+        /// A tool call's id. The runtime executes and answers calls by it, so a
+        /// change would read two halves as two different calls: keep it fatal.
+        strict,
+    };
+
+    fn accept_identity(
+        self: *Reducer,
+        field: []const u8,
+        destination: *?[]u8,
+        value: ?std.json.Value,
+        max_bytes: usize,
+        policy: IdentityPolicy,
+    ) Error!void {
         const text = try string(value orelse return);
         if (text.len == 0) return error.InvalidChunk;
         if (text.len > max_bytes) return error.IdentityTooLarge;
-        if (destination.*) |prior| {
-            if (!std.mem.eql(u8, prior, text)) return error.ConflictingIdentity;
-        } else destination.* = try self.alloc.dupe(u8, text);
+        const prior = destination.* orelse {
+            destination.* = try self.alloc.dupe(u8, text);
+            return;
+        };
+        if (std.mem.eql(u8, prior, text)) return;
+        if (policy == .strict) return error.ConflictingIdentity;
+        // A changed label is the gateway's business, not a corrupt reply: the
+        // text that follows still belongs to this stream, and the turn keeps
+        // the name it started under. Record it where a trace can see it.
+        debug_trace.logf("gateway", "stream_identity_replaced field={s} prior={s} new={s}", .{ field, prior, text });
     }
 
     fn accept_tools(self: *Reducer, value: std.json.Value) Error!void {
@@ -889,7 +899,7 @@ pub const Reducer = struct {
             }
             if (non_null(delta, "id")) |value_id| {
                 const id = try string(value_id);
-                if (id.len != 0) try self.accept_identity(&tool.id, value_id, self.limits.identity_bytes);
+                if (id.len != 0) try self.accept_identity("tool.id", &tool.id, value_id, self.limits.identity_bytes, .strict);
             }
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
@@ -936,13 +946,17 @@ pub const Reducer = struct {
             [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total },
             [_]?u64{ usage.input_tokens, usage.output_tokens, total },
             [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total },
-        ) |previous, current, was_final| {
+            [_][]const u8{ "prompt_tokens", "completion_tokens", "total_tokens" },
+        ) |previous, current, was_final, field| {
             if (previous) |prior| {
                 // A count fx already holds as zero is not an observation a later
                 // snapshot has to reproduce, so a gateway may fill it in later.
                 // Every nonzero prior keeps its exact assertion, so a gateway that
                 // reports a real count still cannot revise or walk it back.
-                if (current.? < prior or (was_final and prior != 0 and current.? != prior)) return error.ConflictingIdentity;
+                if (current.? < prior or (was_final and prior != 0 and current.? != prior)) {
+                    debug_trace.logf("gateway", "stream_usage_conflict field={s} prior={d} current={d}", .{ field, prior, current.? });
+                    return error.ConflictingIdentity;
+                }
             }
         }
         self.usage = usage;
@@ -950,8 +964,10 @@ pub const Reducer = struct {
         self.usage_final_fields = final_fields;
     }
 
-    /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
-    /// explicit errors, never executable partial calls or successful tool turns.
+    /// Requires finish_reason followed by [DONE]. Filter and refusal are
+    /// explicit errors. A reply the output limit cut off returns with the
+    /// `length` reason, as the Gateway and Responses providers return it, so
+    /// the agent loop can resend it; it never runs that reply's partial calls.
     /// A terminal reason that disagrees with the calls the model streamed is
     /// reconciled to what arrived instead of closing the stream.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
@@ -962,9 +978,8 @@ pub const Reducer = struct {
         if (self.phase != .done) return error.IncompleteStream;
         const reason = self.finish_reason.?;
         switch (reason) {
-            .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
-            .stop, .tool_calls => {},
+            .stop, .tool_calls, .length => {},
             else => return error.InvalidFinishReason,
         }
         if (self.refusal_seen) return error.Refused;
@@ -974,9 +989,13 @@ pub const Reducer = struct {
         // none, mislabels the turn rather than corrupting it: fx keeps what
         // arrived and reports the reason that matches. A reply with calls is a
         // tool turn and a reply without them is a prose answer, so a call the
-        // model actually sent is never silently dropped.
-        const terminal_reason: types.ProviderFinishReason = if (self.tools.items.len != 0) .tool_calls else .stop;
-        if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        // model actually sent is never silently dropped. A cut-off reply may
+        // stop anywhere, so it keeps its own reason and is never read as a
+        // complete tool turn.
+        const terminal_reason: types.ProviderFinishReason = if (reason == .length)
+            .length
+        else if (self.tools.items.len != 0) .tool_calls else .stop;
+        if (reason != .length and self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
         // Unadvertised names and invalid arguments are returned as sent. The tool
         // loop decides whether such a call runs and answers the rest, and the
         // permission reviewer retries a malformed decision.
@@ -2399,8 +2418,19 @@ test "chat completions terminal evidence and finish reasons are strict" {
         try test_accept(&reducer, test_stop);
         try std.testing.expectError(error.IncompleteStream, reducer.finish(false));
     }
+    // A cut-off reply returns as such, with or without the call it cut off,
+    // for the agent loop to resend; the loop never runs its calls.
+    const test_length = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}";
+    for ([_]?[]const u8{ test_call, null }) |call| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        if (call) |chunk| try test_accept(&reducer, chunk);
+        var result = try test_finish(&reducer, test_length);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.length, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, if (call != null) 1 else 0), result.completed.completion.tool_calls.len);
+    }
     for ([_]struct { reason: []const u8, failure: Error }{
-        .{ .reason = "length", .failure = error.OutputTruncated },
         .{ .reason = "content_filter", .failure = error.ContentFiltered },
     }) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
@@ -2451,15 +2481,13 @@ test "chat completions reconciles a terminal reason against the streamed calls" 
 test "chat completions rejects malformed chunks contradictory identities and extra choices" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { first: ?[]const u8 = null, chunk: []const u8, failure: Error }{
-        .{ .chunk = "not JSON", .failure = error.InvalidChunk },
+        .{ .chunk = "not JSON", .failure = error.MalformedChatCompletionsChunk },
         .{ .chunk = "{\"choices\":[],\"choices\":[]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"error\":{\"message\":\"bad request\"}}", .failure = error.ProviderError },
         .{ .chunk = "{\"choices\":[{\"index\":1,\"delta\":{}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{}},{\"index\":1,\"delta\":{}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"unknown\"}]}", .failure = error.InvalidFinishReason },
         .{ .first = test_stop, .chunk = test_stop, .failure = error.InconsistentFinishReason },
-        .{ .first = test_text, .chunk = "{\"id\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
-        .{ .first = test_text, .chunk = "{\"model\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"other\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
@@ -2474,6 +2502,22 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         try std.testing.expectError(case.failure, reducer.accept(case.chunk, false));
         try std.testing.expectError(error.StreamClosed, reducer.accept(test_stop, false));
     }
+}
+
+test "chat completions keeps the reply across a gateway that renames the generation" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    // A gateway that hands a reply on to another candidate, or asks a stalled
+    // upstream again, names the second generation in the same stream. The text
+    // still belongs to this turn, so the label changes while the turn keeps the
+    // name it started under instead of failing.
+    try test_accept(&reducer, "{\"id\":\"chat-2\",\"model\":\"other-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}");
+    var result = try test_finish(&reducer, test_stop);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("chat-1", result.completed.completion.generation_id.?);
+    try std.testing.expectEqualStrings("hello there", result.completed.completion.content.?);
 }
 
 test "chat completions usage trailers preserve observations" {

@@ -60,6 +60,7 @@ const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -258,6 +259,12 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    /// The web host's steering as this turn saw it: open at least once, and
+    /// closed by the turn itself at its finalizing boundary. Steering that
+    /// was open and that the host closed is the user's cancel; a host that
+    /// never opened steering cancels nothing this way.
+    saw_host_steering_open: bool = false,
+    closed_host_steering: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -426,6 +433,15 @@ const AcpContext = struct {
                 debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
             };
         }
+    }
+
+    /// Shows a subagent's report on the call that sent its work, after that
+    /// call's own result.
+    fn sendReportUpdate(self: *AcpContext, tool_call_id: []const u8, text: []const u8) !void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, .completed, text);
+        try self.sendUpdate(out.writer.buffered());
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
@@ -1180,6 +1196,10 @@ pub fn handlePrompt(
         }
     };
     try endJournalTurn(alloc, state.alloc, session);
+    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job)) |outcome| {
+        prompt_input.retainImageSnapshots();
+        return outcome;
+    }
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -1237,14 +1257,16 @@ fn maybeStartAcpTitleTask(
     session.title_task = task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title. No-op without a pending task.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt. No-op without a pending task.
 fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
     _ = state;
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(&session.cancel_flag, session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1888,6 +1910,15 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+/// The session's cache warmer, when the profile keeps it on. Unit tests
+/// share the real provider bundles and never ping, and a libfx host owns
+/// its sessions' lifetimes, so its kernel sends no requests of its own.
+fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionState) ?*@import("../core/agent/runtime/cache_warmer.zig").Warmer {
+    if (comptime @import("builtin").is_test or host_target.is_wasm) return null;
+    if (state.cfg.minimal_kernel or !state.cache_warming) return null;
+    return session.session_rt.cacheWarmer();
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
@@ -1931,6 +1962,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .record_usage = if (session.v2 != null) recordUsage else null,
+        .cache_warmer = acpCacheWarmer(ctx.state, session),
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
@@ -1995,15 +2027,18 @@ fn takeSteeringBoundary(
             // As on native, an interrupt this boundary beat is spent here.
             if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
-            const texts = try arena.alloc([]u8, taken.len);
-            for (taken, texts) |entry, *text| {
-                text.* = entry.text;
+            const messages = try arena.alloc(worker_runtime.SteeringMessage, taken.len);
+            for (taken, messages) |entry, *message| {
+                message.* = .{ .text = entry.text };
                 try publishSteeringReplay(ctx, entry.text, null, entry.id);
             }
-            return .{ .continue_turn = texts };
+            return .{ .continue_turn = messages };
         }
         if (steered) return .{ .continue_turn = &.{} };
-        if (close_if_empty) js_host_steering.close();
+        if (close_if_empty) {
+            ctx.closed_host_steering = true;
+            js_host_steering.close();
+        }
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
@@ -2033,7 +2068,21 @@ fn takeSteeringBoundary(
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
         try publishSteeringReplay(ctx, text, request_id, input_id);
     }
-    return .{ .continue_turn = drained.texts };
+    // An ACP client's steering is the user's own.
+    const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
+    for (drained.texts, messages) |text, *message| message.* = .{ .text = text };
+    return .{ .continue_turn = messages };
+}
+
+/// The host closes steering when the user cancels the turn, and the
+/// `session/cancel` it also sends waits on stdin until the prompt returns.
+/// Between sends nothing else carries the cancel, so a retry wait would sit
+/// it out. A host that never opened steering never closes it this way.
+fn cancelOnHostSteeringClosed(ctx: *AcpContext) void {
+    if (!ctx.saw_host_steering_open or ctx.closed_host_steering) return;
+    const session = if (ctx.state.active_session) |*active| active else return;
+    if (session.cancel_flag.swap(true, .seq_cst)) return;
+    debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
 }
 
 /// The web core's cooperative pulse while a model reply streams: steering its
@@ -2041,11 +2090,14 @@ fn takeSteeringBoundary(
 fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (js_host_steering.state()) {
-        .closed => {},
-        .open => |open| if (open.handoff) {
-            server.noteHostSteeringHandoff(ctx.state);
-        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
-            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+        .closed => cancelOnHostSteeringClosed(ctx),
+        .open => |open| {
+            ctx.saw_host_steering_open = true;
+            if (open.handoff) {
+                server.noteHostSteeringHandoff(ctx.state);
+            } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+                debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+            }
         },
     }
 }
@@ -2140,7 +2192,7 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolve(
+    return ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
@@ -2155,6 +2207,7 @@ fn resolveModelCapabilities(
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2170,7 +2223,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolve(
+    _ = ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
@@ -2185,6 +2238,7 @@ fn resolveModelOverride(
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
@@ -2893,6 +2947,96 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// failed left no history entry, so its progress is cleared: resuming is for
 /// turns a stopped process left open. Inputs it took and never placed are
 /// settled. `session_alloc` owns the journal's state.
+/// The prompt ends once its whole tree is quiet: each report
+/// or message a subagent sends runs as the session's next turn, and a report
+/// shows on the subagent call that sent the work. A turn
+/// started this way is the child's, never the user's, so its root context
+/// stays the user's own request. Returns the prompt's outcome when a turn
+/// ends it early.
+fn runReportTurns(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    alloc: Allocator,
+    ctx: *AcpContext,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    agent_config: agent_runtime.Config,
+    base: worker_runtime.QueuedPrompt,
+) !?TerminalOutcome {
+    const tree = state.subagent_host orelse return null;
+    while (true) {
+        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag)) {
+            .quiet, .stopped => return null,
+            .mail => {},
+        }
+        const next = state.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        var answered = server.takeReportCall(state);
+        defer if (answered) |*call| call.deinit(std.heap.c_allocator);
+        const call_id = if (answered) |call| call.call_id else "";
+        if (answered) |call| if (call.call_id.len > 0) {
+            ctx.sendReportUpdate(call.call_id, next.prompt) catch |err| {
+                debug_trace.logf("acp", "report update not sent call_id={s} err={s}", .{ call.call_id, @errorName(err) });
+            };
+            // A hook client learns how the work ended, as it learned it began.
+            if (ctx.observer) |observer| if (call.outcome) |outcome| observer.emit(.{ .delegation = .{
+                .call_id = call.call_id,
+                .child_id = call.child_id,
+                .work_id = call.work_id,
+                .phase = switch (outcome) {
+                    .completed => .completed,
+                    .cancelled => .cancelled,
+                    .failed, .interrupted, .lost => .failed,
+                },
+            } });
+        };
+        if (session.journal) |*journal| {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            journal.barrier_next_progress = !journal.inputs_durable;
+            journal.nameNextTurn(null);
+        }
+        if (session.v2) |v2| {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            try v2.beginTurn();
+        }
+        const history = try session.session_rt.snapshotHistory(alloc);
+        defer types.freeHistoryTurnSlice(alloc, history);
+        var job = base;
+        job.turn_id = 0;
+        job.prompt = next.prompt;
+        job.author = next.author;
+        job.delivery = .continuation;
+        job.images = &.{};
+        job.authorized_image_catalog = &.{};
+        job.history = history;
+        job.unversioned_history_count = session.session_rt.unversionedHistoryEnd();
+        job.recovery_checkpoint = null;
+        job.recovery_source_already_presented = false;
+        debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
+        agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
+            .view = state.lifecycle_view,
+            .scope = .{
+                .kind = .acp,
+                .workspace_root = session.workspace_root,
+                .session_id = session.session_id,
+            },
+            .outcome_allocator = alloc,
+        }, agent_config, job) catch |err| {
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
+            if (err == error.NonInteractivePermissionRequired) {
+                ctx.stop_reason = .refused;
+                return null;
+            }
+            if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
+            return try promptExecutionFailure(err);
+        };
+        try endJournalTurn(alloc, state.alloc, session);
+    }
+}
+
 fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3698,7 +3842,7 @@ test "ACP subagent titles and terminal descriptions share request projection" {
     try std.testing.expectEqualStrings("reviewer · Check replay", title);
     const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
     defer alloc.free(completed);
-    try std.testing.expectEqualStrings("reviewer replied · Check replay", completed);
+    try std.testing.expectEqualStrings("sent to reviewer · Check replay", completed);
     const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "Interrupted" })).?;
     defer alloc.free(interrupted);
     try std.testing.expectEqualStrings("reviewer interrupted · Check replay", interrupted);
@@ -5099,8 +5243,6 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         deps.context_registry.?.defaultProvider().id,
     );
     try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context == null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

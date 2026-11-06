@@ -6,12 +6,18 @@
     ir_size.py --libllvm <libLLVM.dylib> overlay-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> swap-compares <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> widen-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
+    ir_size.py --libllvm <libLLVM.dylib> dropped-outputs <in.bc>
+    ir_size.py --libllvm <libLLVM.dylib> minsize-functions <in.bc> <out.json>
+    ir_size.py --libllvm <libLLVM.dylib> no-outline <in.bc> <out.bc> --functions <names.txt>
+    ir_size.py --libllvm <libLLVM.dylib> name-functions <in.bc> <out.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
 slice free, remap, and aligned allocation, the writer's write, writeAll,
 writeByte, and allocating writer setup and teardown, the byte list's append,
-every list's teardown, slice equality, and the Io mutex's lock and unlock.
+every list's teardown, slice equality and prefix checks, case-insensitive
+ASCII equality, and the Io mutex's lock and unlock.
 Zig inlines them at thousands of call sites (free alone at about
 11,000 in fx); one out-of-line copy per instantiation keeps the same checks,
 poisoning, and calls. Run it on the emitted bitcode, before instrumentation,
@@ -22,7 +28,10 @@ into stores of their defined scalar leaves. Zig materializes `return error.X`
 from a function returning a large `E!T` as a constant `{ T undef, code,
 padding undef }` copied into the result. Copying undefined bytes is refined
 by leaving the destination bytes unchanged, so only the defined bytes are
-stored. Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
+stored. A constant with too many defined bytes for that, such as the default
+value of a large struct, whose leaves are almost all zero, is copied instead
+as a zero fill of the copied bytes followed by stores of its nonzero leaves.
+Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
 
 overlay-constants packs the mostly undefined internal constants that are
 still referenced, the same `return error.X` results plus `return null` results
@@ -45,8 +54,9 @@ a constant expression when it matches regions, so two regions that differ
 only in an instruction's constant, one with 16 and one with 8898, can share a
 parameter that also replaces the nested 16: the second region then reads
 `@g + 8898`. With the expressions rebuilt as instructions, every constant is
-an operand the outliner compares. Run it on each partition right before
-`opt -passes=iroutliner`, with no pass between that could fold them back.
+an operand the outliner compares. Run it on the outliner's input right
+before `opt -passes=iroutliner`, with no pass between that could fold them
+back.
 PHI nodes, landing pads, call targets, and intrinsic calls keep their
 expressions: the outliner never moves an intrinsic call or a PHI's incoming
 constant into a region, and a call target must stay a direct callee.
@@ -59,14 +69,62 @@ reversed region's operands to the outlined function in their original order,
 so that region computes `a < b` instead of `a > b`. A PGSO build of the
 current source turned a skill file read's bounds check around this way and
 panicked on the first chunk. With no greater-than comparison left, the
-outliner matches only comparisons written the same way. Run it on each
-partition right before `opt -passes=iroutliner`, after expand-constant-exprs.
+outliner matches only comparisons written the same way. Run it on the
+outliner's input right before `opt -passes=iroutliner`, after
+expand-constant-exprs.
+
+widen-constants rebuilds each i1 and i16 integer constant an instruction uses
+as an operand, such as the `i1 true` in `call void @f(i1 true)`, as a trunc of
+an i8 or i32 constant. When regions differ in a constant, LLVM's IR outliner
+passes it as a parameter and replaces every use of the first region's constant
+in the outlined function, including the constant each exit returns to tell the
+caller where to continue: i1 for two exits, i16 for more. A region that passes
+`true` where the first passed `false` then returns `true` from the `false`
+exit, and the caller takes the other branch. A PGSO build of the unit tests
+took a slash menu test's `orelse` panic this way on a non-null result. With
+those constants rebuilt, the outliner only passes them as i8 and i32
+parameters, which no exit returns. PHI incoming constants keep their
+constants: rebuilding one at the end of its incoming block turns it into a
+value the region must hand back, and the outliner then sometimes drops that
+store. check-outlined catches a PHI constant that becomes an exit's value.
+Intrinsic arguments that must be immediate, assume-like intrinsics, inline
+asm, GEP indices, and switch cases also keep their constants. Run it on the
+outliner's input right before `opt -passes=iroutliner`, after swap-compares.
+The LLVM bug is https://github.com/llvm/llvm-project/issues/239125.
 
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named
-`constexpr`, or a constant expression with a non-constant operand. After
-expand-constant-exprs neither should exist, so any hit is a form this guard
-does not cover.
+`constexpr`, or a constant expression with a non-constant operand. It also
+fails when an outlined function returns something other than a constant,
+because each exit returns its own constant, and when it has a block other
+than its entry that nothing branches to (see dropped-outputs). After
+expand-constant-exprs and widen-constants the first two should not exist, so
+a hit is a form these guards do not cover.
+
+dropped-outputs prints, as JSON, each outlined function with a block other
+than its entry that nothing branches to, and the functions that call it.
+When two regions store the same outputs in two different ways, LLVM's IR
+outliner needs a switch to pick the stores, but it builds the switch only
+when the stored outputs differ, and the release build skips the assertion
+that catches the case. The stores are left in blocks nothing branches to, so
+each caller reads its output uninitialized. A transformed unit test read a
+garbage error code this way. Nothing else the outliner builds is
+unreachable. The pipeline marks those callers `nooutline` and outlines
+again. The LLVM bug is https://github.com/llvm/llvm-project/issues/239126.
+
+minsize-functions writes the names of the defined functions, and of those
+that carry `minsize`, to a JSON file. Profile use marks the functions it
+judges cold `minsize`.
+
+name-functions gives each defined private function internal linkage. Zig
+emits every function private, and a private function has no symbol in the
+object, so a link that orders by symbol cannot place it. Internal linkage
+generates the same code and keeps a local symbol, which the final link strips.
+
+no-outline adds `nooutline` to the defined functions listed one per line in
+the --functions file. The IR outliner and llc's machine outliner both skip
+such functions, so their code stays in place instead of moving into shared
+helpers elsewhere in the binary. It fails when no listed function is defined.
 
 Every command prints a JSON summary on stdout and exits nonzero when the
 input cannot be read. outline-helpers also fails when no allocator free helper
@@ -89,6 +147,8 @@ OUT_OF_LINE_HELPERS = (
     r"array_list\.Aligned\(u8,null\)\.appendSlice",
     r"array_list\.Aligned\(.*\)\.deinit",
     r"mem\.eql__func_\d+",
+    r"mem\.startsWith(?:__func_\d+)?",
+    r"ascii\.eqlIgnoreCase",
     r"Io\.Mutex\.(?:lock|lockUncancelable|unlock)",
 )
 
@@ -97,6 +157,12 @@ MAX_DEFINED_BYTES = 128
 MAX_LEAVES = 16
 MEMCPY_SITE_BYTES = 16
 STORE_BYTES = 8
+# sparse-constants: a constant too large for leaf stores alone, such as a
+# struct's default value, is copied as a zero fill plus stores of its nonzero
+# leaves, at most this many and this many bytes.
+ZERO_FILL_COPY_MAX_LEAVES = 64
+ZERO_FILL_COPY_MAX_BYTES = 512
+MEMSET_SITE_BYTES = 16
 # overlay-constants: at most this share of a member's bytes may be defined
 # and nonzero, and members below OVERLAY_GUARD_BYTES (the largest copy
 # AArch64 expands into stores in size-optimized code) keep zeros in their
@@ -105,6 +171,11 @@ OVERLAY_MAX_NONZERO_SHARE = 0.25
 OVERLAY_GUARD_BYTES = 64
 OVERLAY_MAX_ALIGN = 16
 OVERLAY_BLOB = b"pgso.overlaid_constants"
+# zero-fill-globals: writable globals at least this large whose nonzero
+# defined bytes fit in ZERO_FILL_MAX_STORED_BYTES move to zero-fill.
+ZERO_FILL_MIN_BYTES = 4096
+ZERO_FILL_MAX_STORED_BYTES = 64
+ZERO_FILL_MAX_STORES = 8
 
 P = C.c_void_p
 STRUCT, ARRAY, INTEGER, POINTER = 10, 11, 8, 12
@@ -121,6 +192,23 @@ OUTLINED_PREFIX = "outlined_ir_func"
 # that LLVM's IR similarity analysis reverses, mapped to its swapped form.
 SWAPPED_INT_PREDICATES = {34: 36, 35: 37, 38: 40, 39: 41}  # ugt, uge, sgt, sge
 SWAPPED_REAL_PREDICATES = {2: 4, 3: 5, 10: 12, 11: 13}  # ogt, oge, ugt, uge
+TRUNC = 30
+# widen-constants: the IR outliner's exit selectors are i1 or i16, so those
+# constants are rebuilt from constants of these widths.
+WIDENED_WIDTHS = {1: 8, 16: 32}
+# The intrinsics LLVM calls assume-like, which the IR outliner never moves.
+ASSUME_LIKE_INTRINSICS = (
+    "llvm.assume",
+    "llvm.sideeffect",
+    "llvm.pseudoprobe",
+    "llvm.dbg.",
+    "llvm.invariant.",
+    "llvm.lifetime.",
+    "llvm.experimental.noalias.scope.decl",
+    "llvm.objectsize.",
+    "llvm.ptr.annotation.",
+    "llvm.var.annotation.",
+)
 
 
 class PassError(Exception):
@@ -179,10 +267,12 @@ class Llvm:
         self.PositionBefore = f("LLVMPositionBuilderBefore", None, P, P)
         self.BuildGEP2 = f("LLVMBuildInBoundsGEP2", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p)
         self.BuildStore = f("LLVMBuildStore", P, P, P, P)
+        self.BuildMemSet = f("LLVMBuildMemSet", P, P, P, P, P, C.c_uint)
         self.SetAlignment = f("LLVMSetAlignment", None, P, C.c_uint)
         self.Erase = f("LLVMInstructionEraseFromParent", None, P)
         self.EnumAttrKind = f("LLVMGetEnumAttributeKindForName", C.c_uint, C.c_char_p, C.c_size_t)
         self.CreateEnumAttr = f("LLVMCreateEnumAttribute", P, P, C.c_uint, C.c_ulonglong)
+        self.CreateStringAttr = f("LLVMCreateStringAttribute", P, P, C.c_char_p, C.c_uint, C.c_char_p, C.c_uint)
         self.AddAttr = f("LLVMAddAttributeAtIndex", None, P, C.c_uint, P)
         self.GetEnumAttrAt = f("LLVMGetEnumAttributeAtIndex", P, P, C.c_uint, C.c_uint)
         self.CallSiteEnumAttr = f("LLVMGetCallSiteEnumAttribute", P, P, C.c_uint, C.c_uint)
@@ -244,6 +334,51 @@ class Llvm:
         self.ConstString = f("LLVMConstStringInContext2", P, P, C.c_char_p, C.c_size_t, C.c_int)
         self.ConstGEP2 = f("LLVMConstInBoundsGEP2", P, P, P, C.POINTER(P), C.c_uint)
         self.DeleteGlobal = f("LLVMDeleteGlobal", None, P)
+        self.IsALoadInst = f("LLVMIsALoadInst", P, P)
+        self.IsAGEPInst = f("LLVMIsAGetElementPtrInst", P, P)
+        self.CountIncoming = f("LLVMCountIncoming", C.c_uint, P)
+        self.IncomingValue = f("LLVMGetIncomingValue", P, P, C.c_uint)
+        self.IncomingBlock = f("LLVMGetIncomingBlock", P, P, C.c_uint)
+        self.BuildPhi = f("LLVMBuildPhi", P, P, P, C.c_char_p)
+        self.AddIncoming = f("LLVMAddIncoming", None, P, C.POINTER(P), C.POINTER(P), C.c_uint)
+        self.BuildCall2 = f("LLVMBuildCall2", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p)
+        self.BuildExtractValue = f("LLVMBuildExtractValue", P, P, P, C.c_uint, C.c_char_p)
+        self.BuildInsertValue = f("LLVMBuildInsertValue", P, P, P, P, C.c_uint, C.c_char_p)
+        self.BuildLoad2 = f("LLVMBuildLoad2", P, P, P, P, C.c_char_p)
+        self.BuildSub = f("LLVMBuildSub", P, P, P, P, C.c_char_p)
+        self.BuildRet = f("LLVMBuildRet", P, P, P)
+        self.PositionAtEnd = f("LLVMPositionBuilderAtEnd", None, P, P)
+        self.AppendBlock = f("LLVMAppendBasicBlockInContext", P, P, P, C.c_char_p)
+        self.AddFunction = f("LLVMAddFunction", P, P, C.c_char_p, P)
+        self.FunctionType = f("LLVMFunctionType", P, P, C.POINTER(P), C.c_uint, C.c_int)
+        self.StructType = f("LLVMStructTypeInContext", P, P, C.POINTER(P), C.c_uint, C.c_int)
+        self.PointerType = f("LLVMPointerTypeInContext", P, P, C.c_uint)
+        self.Int16Ty = f("LLVMInt16TypeInContext", P, P)
+        self.Int32Ty = f("LLVMInt32TypeInContext", P, P)
+        self.GetParam = f("LLVMGetParam", P, P, C.c_uint)
+        self.CountParams = f("LLVMCountParams", C.c_uint, P)
+        self.GetPoison = f("LLVMGetPoison", P, P)
+        self.ConstArray2 = f("LLVMConstArray2", P, P, C.POINTER(P), C.c_ulonglong)
+        self.BuildAlloca = f("LLVMBuildAlloca", P, P, P, C.c_char_p)
+        self.GetNamedFunction = f("LLVMGetNamedFunction", P, P, C.c_char_p)
+        self.EntryBlock = f("LLVMGetEntryBasicBlock", P, P)
+        self.ConstNull = f("LLVMConstNull", P, P)
+        self.IsAAllocaInst = f("LLVMIsAAllocaInst", P, P)
+        self.GetNamedAlias = f("LLVMGetNamedGlobalAlias", P, P, C.c_char_p, C.c_size_t)
+        self.AliasTarget = f("LLVMAliasGetAliasee", P, P)
+        self.IsAFunction = f("LLVMIsAFunction", P, P)
+        self.IsAInlineAsm = f("LLVMIsAInlineAsm", P, P)
+        self.IsATerminator = f("LLVMIsATerminatorInst", P, P)
+        self.IsABranch = f("LLVMIsABranchInst", P, P)
+        self.IsAReturn = f("LLVMIsAReturnInst", P, P)
+        self.NumArgOperands = f("LLVMGetNumArgOperands", C.c_uint, P)
+        self.IntTy = f("LLVMIntTypeInContext", P, P, C.c_uint)
+        self.BlockTerminator = f("LLVMGetBasicBlockTerminator", P, P)
+        self.NumSuccessors = f("LLVMGetNumSuccessors", C.c_uint, P)
+        self.Successor = f("LLVMGetSuccessor", P, P, C.c_uint)
+        self.BlockName = f("LLVMGetBasicBlockName", C.c_char_p, P)
+        self.IsAArgument = f("LLVMIsAArgument", P, P)
+        self.IsAStoreInst = f("LLVMIsAStoreInst", P, P)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -336,13 +471,36 @@ def _leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
         raise _Skip("too many defined bytes")
 
 
+def _copy_leaves(llvm: Llvm, td, init) -> tuple[list, bool]:
+    """The leaves a rewritten copy of `init` stores, and whether it zero-fills
+    the copied bytes first. A constant within the leaf limits stores every
+    defined leaf, zeros included; a larger one stores only its nonzero leaves
+    after the zero fill."""
+    leaves: list = []
+    try:
+        _leaves(llvm, td, init, 0, leaves)
+        return leaves, False
+    except _Skip as skip:
+        if str(skip) not in ("too many defined bytes", "too many defined leaves", "large defined array"):
+            raise
+    leaves = []
+    _nonzero_leaves(llvm, td, init, 0, leaves, ZERO_FILL_COPY_MAX_LEAVES, ZERO_FILL_COPY_MAX_BYTES)
+    return leaves, True
+
+
 def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
     ctx, mod = llvm.load(source)
     td = llvm.CreateTD(llvm.GetDL(mod))
     i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
     builder = llvm.CreateBuilder(ctx)
     align_kind = llvm.kind("align")
-    summary = {"pass": "sparse-constants", "rewritten_constants": 0, "rewritten_copies": 0, "constant_bytes": 0}
+    summary = {
+        "pass": "sparse-constants",
+        "rewritten_constants": 0,
+        "zero_filled_constants": 0,
+        "rewritten_copies": 0,
+        "constant_bytes": 0,
+    }
     glob = llvm.FirstGlobal(mod)
     while glob:
         following = llvm.NextGlobal(glob)
@@ -374,14 +532,14 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                     raise _Skip("volatile copy")
                 copies.append((user, llvm.ConstZExt(length)))
                 use = llvm.NextUse(use)
-            leaves: list = []
-            _leaves(llvm, td, init, 0, leaves)
+            leaves, zero_fill = _copy_leaves(llvm, td, init)
             extra = 0
             for _, length in copies:
                 if any(offset < length < offset + width for offset, _, width, _ in leaves):
                     raise _Skip("copy splits a defined leaf")
                 inside = sum(1 for offset, _, width, _ in leaves if offset + width <= length)
-                extra += max(0, STORE_BYTES * inside - MEMCPY_SITE_BYTES)
+                fill = MEMSET_SITE_BYTES if zero_fill else 0
+                extra += max(0, fill + STORE_BYTES * inside - MEMCPY_SITE_BYTES)
             if extra >= size:
                 raise _Skip("stores would cost more than the constant")
             for call, length in copies:
@@ -389,6 +547,10 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                 attribute = llvm.CallSiteEnumAttr(call, 1, align_kind)
                 destination_align = llvm.EnumAttrValue(attribute) if attribute else 1
                 llvm.PositionBefore(builder, call)
+                if zero_fill:
+                    llvm.BuildMemSet(
+                        builder, destination, llvm.ConstInt(i8, 0, 0), llvm.ConstInt(i64, length, 0), destination_align
+                    )
                 for offset, value, width, natural in leaves:
                     if offset + width > length:
                         continue
@@ -405,6 +567,8 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                 summary["rewritten_copies"] += 1
             summary["rewritten_constants"] += 1
             summary["constant_bytes"] += size
+            if zero_fill:
+                summary["zero_filled_constants"] += 1
         except _Skip:
             pass
         glob = following
@@ -617,6 +781,368 @@ def overlay_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) ->
     return summary
 
 
+def _nonzero_leaves(
+    llvm: Llvm,
+    td,
+    value,
+    base: int,
+    out: list,
+    max_leaves: int = ZERO_FILL_MAX_STORES,
+    max_bytes: int = ZERO_FILL_MAX_STORED_BYTES,
+) -> None:
+    """Collects (offset, constant, size, alignment) for each defined nonzero
+    scalar in `value`; undefined and zero parts hold nothing to restore."""
+    if llvm.IsUndef(value) or llvm.IsNull(value):
+        return
+    ty = llvm.TypeOf(value)
+    kind = llvm.TypeKind(ty)
+    if kind == STRUCT:
+        for i in range(llvm.CountStructElems(ty)):
+            _nonzero_leaves(
+                llvm, td, llvm.AggElem(value, i), base + llvm.OffsetOfElement(td, ty, i), out, max_leaves, max_bytes
+            )
+        return
+    if kind == ARRAY:
+        element = llvm.ElementType(ty)
+        stride = llvm.ABISize(td, element)
+        for i in range(llvm.ArrayLen(ty)):
+            item = llvm.AggElem(value, i)
+            if not item:
+                raise _Skip("unreadable array element")
+            _nonzero_leaves(llvm, td, item, base + i * stride, out, max_leaves, max_bytes)
+        return
+    scalar = (
+        (kind == INTEGER and llvm.IsAConstantInt(value))
+        or (kind == POINTER and llvm.IsConstant(value))
+        or (kind in FLOATS and llvm.IsAConstantFP(value))
+    )
+    if not scalar:
+        raise _Skip(f"unsupported leaf kind {kind}")
+    out.append((base, value, llvm.ABISize(td, ty), llvm.ABIAlign(td, ty)))
+    if len(out) > max_leaves or sum(leaf[2] for leaf in out) > max_bytes:
+        raise _Skip("too many nonzero bytes")
+
+
+def _zero_fill_plan(llvm: Llvm, td, glob):
+    if llvm.IsDeclaration(glob) or llvm.IsGlobalConstant(glob):
+        return None
+    if llvm.GetLinkage(glob) not in (INTERNAL_LINKAGE, PRIVATE_LINKAGE):
+        return None
+    if llvm.IsThreadLocal(glob) or llvm.IsExternallyInitialized(glob) or llvm.GetSection(glob) or llvm.GetComdat(glob):
+        return None
+    ty = llvm.GlobalValueType(glob)
+    size = llvm.ABISize(td, ty)
+    initializer = llvm.GetInitializer(glob)
+    if size < ZERO_FILL_MIN_BYTES or not initializer or llvm.IsNull(initializer) or llvm.IsUndef(initializer):
+        return None
+    stores: list = []
+    try:
+        _nonzero_leaves(llvm, td, initializer, 0, stores)
+    except _Skip:
+        return None
+    # Without a nonzero byte, LLVM already puts the global in zero-fill.
+    return (glob, ty, size, stores) if stores else None
+
+
+def _entry_function(llvm: Llvm, mod):
+    """`main`, or the function it aliases: Zig defines the program's `main`
+    as an alias of an internal function."""
+    entry = llvm.GetNamedFunction(mod, b"main")
+    if entry:
+        return entry
+    alias = llvm.GetNamedAlias(mod, b"main", 4)
+    return llvm.IsAFunction(llvm.AliasTarget(alias)) if alias else None
+
+
+def zero_fill_globals(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Moves large writable globals that are almost all zero or undefined to
+    zero-fill, which takes no space in the file, and stores their few nonzero
+    bytes at the start of `main` instead.
+
+    A writable global with even one nonzero byte in its initializer is
+    written out whole. `main` runs before anything else in the program reads
+    these globals, and no later pipeline stage evaluates stores back into an
+    initializer, so every read sees the same value as before."""
+    ctx, mod = llvm.load(source)
+    td = llvm.CreateTD(llvm.GetDL(mod))
+    summary = {"pass": "zero-fill-globals", "zero_filled_globals": 0, "zero_filled_bytes": 0, "stored_bytes": 0}
+    entry_fn = _entry_function(llvm, mod)
+    if not entry_fn or llvm.IsDeclaration(entry_fn):
+        llvm.save(mod, output)
+        summary["skipped"] = "no main"
+        return summary
+    plans = []
+    glob = llvm.FirstGlobal(mod)
+    while glob:
+        plan = _zero_fill_plan(llvm, td, glob)
+        if plan:
+            plans.append(plan)
+        glob = llvm.NextGlobal(glob)
+    if plans:
+        i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+        builder = llvm.CreateBuilder(ctx)
+        first = llvm.FirstInstruction(llvm.EntryBlock(entry_fn))
+        while first and llvm.IsAAllocaInst(first):
+            first = llvm.NextInstruction(first)
+        if not first:
+            raise PassError("main has an empty entry block")
+        llvm.PositionBefore(builder, first)
+        for glob, ty, size, stores in plans:
+            llvm.SetInitializer(glob, llvm.ConstNull(ty))
+            for offset, value, width, align in stores:
+                index = (P * 1)(llvm.ConstInt(i64, offset, 0))
+                address = llvm.BuildGEP2(builder, i8, glob, index, 1, b"")
+                store = llvm.BuildStore(builder, value, address)
+                llvm.SetAlignment(store, align)
+                summary["stored_bytes"] += width
+            summary["zero_filled_globals"] += 1
+            summary["zero_filled_bytes"] += size
+    llvm.save(mod, output)
+    return summary
+
+
+ERROR_NAME_TABLE = b"__zig_error_name_table"
+ZEXT = 31
+
+
+def _users(llvm: Llvm, value) -> list:
+    out = []
+    use = llvm.FirstUse(value)
+    while use:
+        out.append(llvm.GetUser(use))
+        use = llvm.NextUse(use)
+    return out
+
+
+def _error_names(llvm: Llvm, td, table) -> list[bytes]:
+    """Each entry's name: Zig fills the table with (pointer, length) pairs
+    into NUL-terminated strings, and leaves entry 0 undefined."""
+    ty = llvm.GlobalValueType(table)
+    initializer = llvm.GetInitializer(table)
+    if (
+        llvm.IsDeclaration(table)
+        or not llvm.IsGlobalConstant(table)
+        or llvm.GetLinkage(table) not in (INTERNAL_LINKAGE, PRIVATE_LINKAGE)
+        or not initializer
+        or llvm.TypeKind(ty) != ARRAY
+        or llvm.ABISize(td, llvm.ElementType(ty)) != 16
+    ):
+        raise _Skip("unexpected error name table")
+    names = []
+    for i in range(llvm.ArrayLen(ty)):
+        entry = llvm.AggElem(initializer, i)
+        if not entry:
+            raise _Skip("unreadable error name entry")
+        if llvm.IsUndef(entry):
+            names.append(b"")
+            continue
+        pointer, length = llvm.AggElem(entry, 0), llvm.AggElem(entry, 1)
+        string = llvm.IsAGlobalValue(pointer) if pointer else None
+        if not string or not length or not llvm.IsAConstantInt(length) or not llvm.IsGlobalConstant(string):
+            raise _Skip("error name entry is not a string and length")
+        data = llvm.GetInitializer(string)
+        if not data or not llvm.IsAConstantDataSequential(data):
+            raise _Skip("error name is not constant bytes")
+        size = C.c_size_t()
+        raw = C.string_at(llvm.GetAsString(data, C.byref(size)), size.value)
+        count = llvm.ConstZExt(length)
+        if count >= len(raw) or raw[count] != 0:
+            raise _Skip("error name is not NUL-terminated")
+        names.append(raw[:count])
+    return names
+
+
+def _passes_to_reader(llvm: Llvm, call, entry) -> bool:
+    """Whether `call` passes `entry` only as arguments of a function defined in
+    the module that only reads them, like the pair copies the IR outliner
+    makes. The callee is left unchanged."""
+    callee = llvm.IsAFunction(llvm.CalledValue(call))
+    if not callee or llvm.IsDeclaration(callee):
+        return False
+    # The called function is a call's last operand.
+    arguments = llvm.NumOperands(call) - 1
+    if arguments != llvm.CountParams(callee):
+        return False
+    passed = False
+    for i in range(arguments):
+        if llvm.GetOperand(call, i) == entry:
+            passed = True
+            try:
+                _entry_reads(llvm, llvm.GetParam(callee, i), allow_phi=False, allow_calls=False)
+            except _Skip:
+                return False
+    return passed
+
+
+def _entry_reads(llvm: Llvm, entry, allow_phi: bool, allow_calls: bool = True) -> tuple[list, list, list, list, list]:
+    """The loads of an entry's name pointer and length, the length-field
+    addresses, the PHIs that merge entries, and the calls that pass the entry
+    to a function that only reads it. Anything else stops the pass."""
+    name_loads, length_loads, length_fields, phis, calls = [], [], [], [], []
+    for user in _users(llvm, entry):
+        if llvm.IsALoadInst(user) and llvm.TypeKind(llvm.TypeOf(user)) == POINTER:
+            name_loads.append(user)
+        elif llvm.IsAGEPInst(user) and llvm.NumOperands(user) == 2 and llvm.GetOperand(user, 0) == entry:
+            source, offset = llvm.GEPSourceType(user), llvm.GetOperand(user, 1)
+            if (
+                llvm.TypeKind(source) != INTEGER
+                or llvm.IntWidth(source) != 8
+                or not llvm.IsAConstantInt(offset)
+                or llvm.ConstZExt(offset) != 8
+            ):
+                raise _Skip("error name entry read at an unexpected offset")
+            for load in _users(llvm, user):
+                ty = llvm.TypeOf(load)
+                if not llvm.IsALoadInst(load) or llvm.TypeKind(ty) != INTEGER or llvm.IntWidth(ty) != 64:
+                    raise _Skip("error name length used other than by a load")
+                length_loads.append(load)
+            length_fields.append(user)
+        elif allow_phi and llvm.IsAPHINode(user):
+            phis.append(user)
+        elif allow_calls and llvm.IsACallInst(user) and _passes_to_reader(llvm, user, entry):
+            if user not in calls:
+                calls.append(user)
+        else:
+            raise _Skip("error name entry used other than by reading it")
+    return name_loads, length_loads, length_fields, phis, calls
+
+
+def _error_name_function(llvm: Llvm, ctx, mod, names: list[bytes]):
+    """`pgso.error_name(index)` returns the same (pointer, length) pair as the
+    table entry. The names share one blob, each still NUL-terminated, and an
+    entry's length is the distance to the next name minus its NUL."""
+    i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+    blob = b"".join(name + b"\x00" for name in names)
+    offsets = [0]
+    for name in names:
+        offsets.append(offsets[-1] + len(name) + 1)
+    width = llvm.Int16Ty(ctx) if offsets[-1] < 1 << 16 else llvm.Int32Ty(ctx)
+    values = (P * len(offsets))(*[llvm.ConstInt(width, offset, 0) for offset in offsets])
+    offset_table = llvm.AddGlobal(mod, llvm.ArrayType2(width, len(offsets)), b"pgso.error_name_offsets")
+    llvm.SetInitializer(offset_table, llvm.ConstArray2(width, values, len(offsets)))
+    blob_global = llvm.AddGlobal(mod, llvm.ArrayType2(i8, len(blob)), b"pgso.error_names")
+    llvm.SetInitializer(blob_global, llvm.ConstString(ctx, blob, len(blob), 1))
+    for glob in (offset_table, blob_global):
+        llvm.SetGlobalConstant(glob, 1)
+        llvm.SetLinkage(glob, INTERNAL_LINKAGE)
+        llvm.SetUnnamedAddress(glob, GLOBAL_UNNAMED_ADDR)
+
+    pointer = llvm.PointerType(ctx, 0)
+    pair = llvm.StructType(ctx, (P * 2)(pointer, i64), 2, 0)
+    fn_type = llvm.FunctionType(pair, (P * 1)(i64), 1, 0)
+    fn = llvm.AddFunction(mod, b"pgso.error_name", fn_type)
+    llvm.SetLinkage(fn, INTERNAL_LINKAGE)
+    for attribute in ("noinline", "minsize", "optsize", "nounwind"):
+        llvm.AddAttr(fn, FUNCTION_INDEX, llvm.CreateEnumAttr(ctx, llvm.kind(attribute), 0))
+    builder = llvm.CreateBuilder(ctx)
+    llvm.PositionAtEnd(builder, llvm.AppendBlock(ctx, fn, b"entry"))
+    index = llvm.GetParam(fn, 0)
+    start_at = llvm.BuildGEP2(builder, width, offset_table, (P * 1)(index), 1, b"")
+    end_at = llvm.BuildGEP2(builder, width, start_at, (P * 1)(llvm.ConstInt(i64, 1, 0)), 1, b"")
+    start = llvm.BuildCast(builder, ZEXT, llvm.BuildLoad2(builder, width, start_at, b""), i64, b"")
+    end = llvm.BuildCast(builder, ZEXT, llvm.BuildLoad2(builder, width, end_at, b""), i64, b"")
+    name = llvm.BuildGEP2(builder, i8, blob_global, (P * 1)(start), 1, b"")
+    length = llvm.BuildSub(builder, llvm.BuildSub(builder, end, start, b""), llvm.ConstInt(i64, 1, 0), b"")
+    result = llvm.BuildInsertValue(builder, llvm.GetPoison(pair), name, 0, b"")
+    result = llvm.BuildInsertValue(builder, result, length, 1, b"")
+    llvm.BuildRet(builder, result)
+    return fn, fn_type
+
+
+def compact_error_names(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Reads error names through one function over a compact table.
+
+    Zig's `__zig_error_name_table` holds a 16-byte (pointer, length) entry
+    per error and is read in place at every `@errorName`, so its pointers
+    keep it in relocated data. Each read becomes a call to
+    `pgso.error_name`, which returns the same pair from 16-bit offsets into
+    one blob of the same NUL-terminated names. Where a PHI merges an entry's
+    address with another pointer, or a call passes it to a function that only
+    reads it, the pair goes to a stack slot laid out like the entry, and the
+    PHI or call carries the slot. Any table entry or use the pass does not
+    recognize leaves the module unchanged."""
+    ctx, mod = llvm.load(source)
+    td = llvm.CreateTD(llvm.GetDL(mod))
+    summary = {"pass": "compact-error-names", "rewritten_reads": 0, "spilled_reads": 0, "names": 0}
+    table = llvm.GetNamedGlobal(mod, ERROR_NAME_TABLE)
+    try:
+        if not table:
+            raise _Skip("no error name table")
+        names = _error_names(llvm, td, table)
+        plans, phis = [], {}
+        for user in _users(llvm, table):
+            if not llvm.IsAGEPInst(user) or llvm.NumOperands(user) != 2 or llvm.GetOperand(user, 0) != table:
+                raise _Skip("error name table used other than by indexing it")
+            index = llvm.GetOperand(user, 1)
+            index_type = llvm.TypeOf(index)
+            if llvm.ABISize(td, llvm.GEPSourceType(user)) != 16 or llvm.TypeKind(index_type) != INTEGER or llvm.IntWidth(index_type) != 64:
+                raise _Skip("unexpected error name index")
+            reads = _entry_reads(llvm, user, allow_phi=True)
+            plans.append((user, index, reads))
+            for phi in reads[3]:
+                phis[phi] = None
+        for phi in phis:
+            # The merged pointer must itself be read only as an entry.
+            _entry_reads(llvm, phi, allow_phi=False)
+    except _Skip as reason:
+        llvm.save(mod, output)
+        summary["skipped"] = str(reason)
+        return summary
+
+    fn, fn_type = _error_name_function(llvm, ctx, mod, names)
+    builder = llvm.CreateBuilder(ctx)
+    i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+    pair = llvm.StructType(ctx, (P * 2)(llvm.PointerType(ctx, 0), i64), 2, 0)
+
+    def new_slot(inst):
+        entry_block = llvm.EntryBlock(llvm.BlockParent(llvm.InstParent(inst)))
+        llvm.PositionBefore(builder, llvm.FirstInstruction(entry_block))
+        slot = llvm.BuildAlloca(builder, pair, b"")
+        llvm.SetAlignment(slot, 8)
+        return slot
+
+    def store_pair(slot, name, length):
+        llvm.SetAlignment(llvm.BuildStore(builder, name, slot), 8)
+        length_at = llvm.BuildGEP2(builder, i8, slot, (P * 1)(llvm.ConstInt(i64, 8, 0)), 1, b"")
+        llvm.SetAlignment(llvm.BuildStore(builder, length, length_at), 8)
+
+    slots = {phi: new_slot(phi) for phi in phis}
+    for gep, index, (name_loads, length_loads, length_fields, gep_phis, gep_calls) in plans:
+        call_slot = new_slot(gep) if gep_calls else None
+        llvm.PositionBefore(builder, gep)
+        call = llvm.BuildCall2(builder, fn_type, fn, (P * 1)(index), 1, b"")
+        name = llvm.BuildExtractValue(builder, call, 0, b"")
+        length = llvm.BuildExtractValue(builder, call, 1, b"")
+        for load in name_loads:
+            llvm.ReplaceAllUses(load, name)
+            llvm.Erase(load)
+        for load in length_loads:
+            llvm.ReplaceAllUses(load, length)
+            llvm.Erase(load)
+        for field in length_fields:
+            llvm.Erase(field)
+        for phi in gep_phis:
+            slot = slots[phi]
+            store_pair(slot, name, length)
+            for k in range(llvm.CountIncoming(phi)):
+                if llvm.IncomingValue(phi, k) == gep:
+                    llvm.SetOperand(phi, k, slot)
+            summary["spilled_reads"] += 1
+        if call_slot is not None:
+            store_pair(call_slot, name, length)
+            for passing in gep_calls:
+                for k in range(llvm.NumOperands(passing) - 1):
+                    if llvm.GetOperand(passing, k) == gep:
+                        llvm.SetOperand(passing, k, call_slot)
+            summary["spilled_reads"] += 1
+        if name_loads or length_loads:
+            summary["rewritten_reads"] += 1
+        llvm.Erase(gep)
+    summary["names"] = len(names)
+    llvm.save(mod, output)
+    return summary
+
+
 def _instructions(llvm: Llvm, fn):
     block = llvm.FirstBlock(fn)
     while block:
@@ -747,6 +1273,81 @@ def swap_compares(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dic
     return summary
 
 
+def _widenable_operands(llvm: Llvm, inst) -> range:
+    """The operands of `inst` that the IR outliner could turn into parameters
+    and that may hold a value other than a constant."""
+    if (
+        # A trunc for a PHI's incoming constant would sit in the incoming
+        # block, and where that block is in a region and the PHI is not, the
+        # outliner can drop the region's store of the PHI's value.
+        llvm.IsAPHINode(inst)
+        or llvm.IsALandingPad(inst)
+        or llvm.IsAAllocaInst(inst)
+        # The outliner only matches GEPs with equal indices, and struct
+        # indices must stay constant.
+        or llvm.IsAGEPInst(inst)
+        # Switch cases must stay constant. Other terminators but `br` never
+        # join a region.
+        or (llvm.IsATerminator(inst) and not llvm.IsABranch(inst))
+    ):
+        return range(0)
+    if not llvm.IsACallInst(inst):
+        return range(llvm.NumOperands(inst))
+    callee = llvm.CalledValue(inst)
+    if llvm.IsAInlineAsm(callee):
+        # An inline asm operand may need an immediate.
+        return range(0)
+    if llvm.IsAIntrinsic(inst) and llvm.name(callee).startswith(ASSUME_LIKE_INTRINSICS):
+        return range(0)
+    return range(llvm.NumArgOperands(inst))
+
+
+def _wide_constant(llvm: Llvm, ctx, constant):
+    """The wider constant `constant` is rebuilt from, or None when it is not
+    an i1 or i16 integer."""
+    if not llvm.IsAConstantInt(constant):
+        return None
+    width = WIDENED_WIDTHS.get(llvm.IntWidth(llvm.TypeOf(constant)))
+    if width is None:
+        return None
+    return llvm.ConstInt(llvm.IntTy(ctx, width), llvm.ConstZExt(constant), 0)
+
+
+def _truncated(llvm: Llvm, builder, wide, narrow_type, before):
+    """`trunc wide to narrow_type` as an instruction before `before`."""
+    llvm.PositionBefore(builder, before)
+    # The builder folds a cast of a constant, so cast a placeholder.
+    placeholder = llvm.BuildFreeze(builder, wide, b"")
+    inst = llvm.BuildCast(builder, TRUNC, placeholder, narrow_type, b"pgso.wide")
+    llvm.SetOperand(inst, 0, wide)
+    llvm.Erase(placeholder)
+    return inst
+
+
+def widen_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    builder = llvm.CreateBuilder(ctx)
+    immarg = llvm.kind("immarg")
+    summary = {"pass": "widen-constants", "widened_operands": 0}
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            for inst in _instructions(llvm, fn):
+                callee = llvm.CalledValue(inst) if llvm.IsAIntrinsic(inst) else None
+                for index in _widenable_operands(llvm, inst):
+                    if callee is not None and llvm.GetEnumAttrAt(callee, index + 1, immarg):
+                        continue
+                    constant = llvm.GetOperand(inst, index)
+                    wide = _wide_constant(llvm, ctx, constant)
+                    if wide is None:
+                        continue
+                    llvm.SetOperand(inst, index, _truncated(llvm, builder, wide, llvm.TypeOf(constant), inst))
+                    summary["widened_operands"] += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return summary
+
+
 def _holds_parameter(llvm: Llvm, expression) -> bool:
     for i in range(llvm.NumOperands(expression)):
         operand = llvm.GetOperand(expression, i)
@@ -755,6 +1356,81 @@ def _holds_parameter(llvm: Llvm, expression) -> bool:
         if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
             return True
     return False
+
+
+def _unreachable_blocks(llvm: Llvm, fn) -> list[tuple[str, bool]]:
+    """The non-entry blocks of `fn` that no terminator branches to, each with
+    whether it stores through one of `fn`'s parameters."""
+    blocks, targets = [], set()
+    block = llvm.FirstBlock(fn)
+    while block:
+        blocks.append(block)
+        terminator = llvm.BlockTerminator(block)
+        if terminator:
+            for index in range(llvm.NumSuccessors(terminator)):
+                targets.add(llvm.Successor(terminator, index))
+        block = llvm.NextBlock(block)
+    found = []
+    for position, block in enumerate(blocks[1:], start=1):
+        if block in targets:
+            continue
+        stores = False
+        inst = llvm.FirstInstruction(block)
+        while inst:
+            if llvm.IsAStoreInst(inst) and llvm.IsAArgument(llvm.GetOperand(inst, 1)):
+                stores = True
+            inst = llvm.NextInstruction(inst)
+        name = llvm.BlockName(block)
+        found.append((name.decode("utf-8", "replace") if name else f"#{position}", stores))
+    return found
+
+
+def _callers(llvm: Llvm, fn) -> list[str]:
+    return sorted({
+        llvm.name(llvm.BlockParent(llvm.InstParent(user)))
+        for user in _users(llvm, fn)
+        if llvm.IsAInstruction(user)
+    })
+
+
+def _dropped_outputs(llvm: Llvm, mod) -> tuple[int, list[dict]]:
+    """The number of outlined functions in `mod`, and those with a non-entry
+    block that nothing branches to.
+
+    The IR outliner leaves such blocks when two regions store the same
+    outputs in two different ways, which needs a switch it only builds when
+    the stored outputs differ. The blocks hold the stores of the region's
+    outputs, so those stores never run and each caller reads its output slot
+    uninitialized. Nothing else the outliner or CodeExtractor builds is
+    unreachable.
+    """
+    count, instances = 0, []
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        name = llvm.name(fn)
+        if not llvm.IsDeclaration(fn) and name.startswith(OUTLINED_PREFIX):
+            count += 1
+            blocks = _unreachable_blocks(llvm, fn)
+            if blocks:
+                instances.append({
+                    "function": name,
+                    "blocks": [block for block, _ in blocks],
+                    "stores_to_parameter": any(stores for _, stores in blocks),
+                    "callers": _callers(llvm, fn),
+                })
+        fn = llvm.NextFunction(fn)
+    return count, instances
+
+
+def dropped_outputs(llvm: Llvm, source: pathlib.Path) -> dict:
+    _, mod = llvm.load(source)
+    count, instances = _dropped_outputs(llvm, mod)
+    return {
+        "pass": "dropped-outputs",
+        "outlined_functions": count,
+        "instances": instances,
+        "callers": sorted({caller for instance in instances for caller in instance["callers"]}),
+    }
 
 
 def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
@@ -769,14 +1445,79 @@ def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
             for inst in _instructions(llvm, fn):
                 if llvm.name(inst).startswith("constexpr"):
                     findings.append(f"{name}: rebuilt constant expression {llvm.name(inst)}")
+                if llvm.IsAReturn(inst) and llvm.NumOperands(inst) and not llvm.IsConstant(llvm.GetOperand(inst, 0)):
+                    findings.append(f"{name}: exit selector replaced by a parameter")
                 for index in range(llvm.NumOperands(inst)):
                     operand = llvm.GetOperand(inst, index)
                     if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
                         findings.append(f"{name}: constant expression with a parameter operand")
         fn = llvm.NextFunction(fn)
+    for instance in _dropped_outputs(llvm, mod)[1]:
+        findings.append(
+            f"{instance['function']}: output stores in blocks with no predecessors "
+            f"({', '.join(instance['blocks'])}), called from {', '.join(instance['callers']) or 'nothing'}"
+        )
     if findings:
-        raise PassError("IR outliner folded a nested constant into a parameter: " + "; ".join(findings[:8]))
+        raise PassError(
+            "IR outliner miscompiled an outlined function: "
+            + "; ".join(findings[:8])
+            + ". scripts/pgso/README.md describes each case; a caller can be kept out of outlining with no-outline"
+        )
     return summary
+
+
+def minsize_functions(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Write the defined functions, and those marked `minsize`, to `output`.
+
+    Profile use marks the functions it judges cold `minsize`. The lists go to
+    a file because a whole program's names outgrow captured output.
+    """
+    _, mod = llvm.load(source)
+    minsize = llvm.kind("minsize")
+    defined: list[str] = []
+    small: list[str] = []
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            name = llvm.name(fn)
+            defined.append(name)
+            if llvm.GetEnumAttrAt(fn, FUNCTION_INDEX, minsize):
+                small.append(name)
+        fn = llvm.NextFunction(fn)
+    output.write_text(
+        json.dumps({"defined": sorted(defined), "minsize": sorted(small)}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"pass": "minsize-functions", "defined_functions": len(defined), "minsize_functions": len(small)}
+
+
+def no_outline(llvm: Llvm, source: pathlib.Path, output: pathlib.Path, functions: pathlib.Path) -> dict:
+    names = {line.strip() for line in functions.read_text(encoding="utf-8").splitlines() if line.strip()}
+    ctx, mod = llvm.load(source)
+    marked = 0
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn) and llvm.name(fn) in names:
+            llvm.AddAttr(fn, FUNCTION_INDEX, llvm.CreateStringAttr(ctx, b"nooutline", 9, b"", 0))
+            marked += 1
+        fn = llvm.NextFunction(fn)
+    if marked == 0:
+        raise PassError(f"no function listed in {functions} is defined")
+    llvm.save(mod, output)
+    return {"pass": "no-outline", "listed_functions": len(names), "marked_functions": marked}
+
+
+def name_functions(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    named = 0
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn) and llvm.GetLinkage(fn) == PRIVATE_LINKAGE:
+            llvm.SetLinkage(fn, INTERNAL_LINKAGE)
+            named += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return {"pass": "name-functions", "named_functions": named}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -784,24 +1525,50 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
     parser.add_argument(
         "command",
-        choices=("outline-helpers", "sparse-constants", "overlay-constants", "expand-constant-exprs", "swap-compares", "check-outlined"),
+        choices=(
+            "outline-helpers",
+            "sparse-constants",
+            "overlay-constants",
+            "zero-fill-globals",
+            "compact-error-names",
+            "expand-constant-exprs",
+            "swap-compares",
+            "widen-constants",
+            "check-outlined",
+            "dropped-outputs",
+            "minsize-functions",
+            "no-outline",
+            "name-functions",
+        ),
     )
     parser.add_argument("source", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path, nargs="?")
+    parser.add_argument("--functions", type=pathlib.Path)
     args = parser.parse_args(argv)
-    if (args.output is None) != (args.command == "check-outlined"):
-        parser.error("check-outlined takes only an input; the other commands need an output")
+    if (args.output is None) != (args.command in ("check-outlined", "dropped-outputs")):
+        parser.error("check-outlined and dropped-outputs take only an input; the other commands need an output")
+    if (args.functions is None) == (args.command == "no-outline"):
+        parser.error("--functions goes with no-outline, and only with it")
     try:
         llvm = Llvm(args.libllvm)
         if args.command == "check-outlined":
             summary = check_outlined(llvm, args.source)
+        elif args.command == "dropped-outputs":
+            summary = dropped_outputs(llvm, args.source)
+        elif args.command == "no-outline":
+            summary = no_outline(llvm, args.source, args.output, args.functions)
         else:
             run = {
                 "outline-helpers": outline_helpers,
                 "sparse-constants": sparse_constants,
                 "overlay-constants": overlay_constants,
+                "zero-fill-globals": zero_fill_globals,
+                "compact-error-names": compact_error_names,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
+                "widen-constants": widen_constants,
+                "minsize-functions": minsize_functions,
+                "name-functions": name_functions,
             }[args.command]
             summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:
